@@ -1,0 +1,13 @@
+import express from "express";
+import upload from "../middleware/uploadMiddleware.js";
+import { uploadEquipmentMedia } from "../controllers/equipmentMediaController.js";
+
+const router = express.Router();
+
+router.post(
+    "/equipment/:equipmentId/media",
+    upload.single("media"),
+    uploadEquipmentMedia
+);
+
+export default router;
