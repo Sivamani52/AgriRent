@@ -1,12 +1,14 @@
 import cloudinary from "../config/cloudinary.js";
-import pool from "../config/db.js";
+import pool from "../db.js";
 
-const uploadToCloudinary = (file) => {
+/**
+ * Uploads a buffer directly to Cloudinary using upload_stream
+ * @param {Buffer} fileBuffer - File buffer from multer memoryStorage
+ * @param {string} resourceType - "image" | "video"
+ * @returns {Promise<object>} - Cloudinary upload result
+ */
+const uploadToCloudinary = (fileBuffer, resourceType) => {
     return new Promise((resolve, reject) => {
-        const resourceType = file.mimetype.startsWith("video/")
-            ? "video"
-            : "image";
-
         const stream = cloudinary.uploader.upload_stream(
             {
                 folder: "agrirent/equipment",
@@ -14,21 +16,25 @@ const uploadToCloudinary = (file) => {
             },
             (error, result) => {
                 if (error) {
-                    reject(error);
-                } else {
-                    resolve(result);
+                    return reject(error);
                 }
+                resolve(result);
             }
         );
 
-        stream.end(file.buffer);
+        stream.end(fileBuffer);
     });
 };
 
+/**
+ * Upload equipment media (Image or Video)
+ * Route: POST /api/equipment/:equipmentId/media
+ */
 export const uploadEquipmentMedia = async (req, res) => {
     try {
         const { equipmentId } = req.params;
 
+        // 1. Verify file was provided
         if (!req.file) {
             return res.status(400).json({
                 success: false,
@@ -36,6 +42,7 @@ export const uploadEquipmentMedia = async (req, res) => {
             });
         }
 
+        // 2. Verify that equipment exists in the database
         const [equipment] = await pool.query(
             "SELECT id FROM equipment WHERE id = ?",
             [equipmentId]
@@ -48,41 +55,69 @@ export const uploadEquipmentMedia = async (req, res) => {
             });
         }
 
-        const result = await uploadToCloudinary(req.file);
+        // 3. Foreign key resolution for uploaded_by
+        // TODO: Replace temporary development user ID with authenticated user ID (req.user.id)
+        // once JWT authentication middleware is implemented.
+        // Currently, auth is not implemented, so we verify a real existing user in the database.
+        let uploadedBy = req.body?.uploaded_by || req.body?.uploadedBy;
 
-        const mediaType = req.file.mimetype.startsWith("video/")
-            ? "VIDEO"
-            : "IMAGE";
+        if (uploadedBy) {
+            const [user] = await pool.query(
+                "SELECT id FROM users WHERE id = ?",
+                [uploadedBy]
+            );
 
-        const uploadedBy = req.user.id;
+            if (user.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: "User not found"
+                });
+            }
+        } else {
+            const [existingUsers] = await pool.query(
+                "SELECT id FROM users LIMIT 1"
+            );
 
+            if (existingUsers.length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "No user found in database. An existing user is required for uploaded_by foreign key."
+                });
+            }
+            uploadedBy = existingUsers[0].id;
+        }
+
+        // 4. Detect media type from MIME type
+        const isVideo = req.file.mimetype.startsWith("video/");
+        const mediaType = isVideo ? "VIDEO" : "IMAGE";
+        const resourceType = isVideo ? "video" : "image";
+
+        // 5. Upload file buffer to Cloudinary
+        const result = await uploadToCloudinary(req.file.buffer, resourceType);
+
+        // 6. Store Cloudinary secure_url in MySQL equipment_media table
         const [insertResult] = await pool.query(
-            `INSERT INTO equipment_media
-            (equipment_id, media_type, file_url, uploaded_by)
-            VALUES (?, ?, ?, ?)`,
-            [
-                equipmentId,
-                mediaType,
-                result.secure_url,
-                uploadedBy
-            ]
+            `INSERT INTO equipment_media (equipment_id, media_type, file_url, uploaded_by)
+             VALUES (?, ?, ?, ?)`,
+            [equipmentId, mediaType, result.secure_url, uploadedBy]
         );
 
-        res.status(201).json({
+        // 7. Return generated Cloudinary URL and record in the response
+        return res.status(201).json({
             success: true,
             message: "Media uploaded successfully",
             data: {
                 id: insertResult.insertId,
-                equipmentId,
+                equipmentId: Number(equipmentId),
                 mediaType,
                 fileUrl: result.secure_url
             }
         });
 
     } catch (error) {
-        console.error("Upload equipment media error:", error);
+        console.error("Upload equipment media error:", error.message || error);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message: "Failed to upload media"
         });

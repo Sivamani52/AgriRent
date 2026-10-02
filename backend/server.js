@@ -1,17 +1,14 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import db from "./db.js";
-
-
 import equipmentMediaRoutes from "./routes/equipmentMediaRoutes.js";
-
-dotenv.config();
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 app.use("/api", equipmentMediaRoutes);
 
@@ -31,8 +28,17 @@ app.get("/api/db-check", async (req, res) => {
   }
 });
 
+// Global error handling middleware (handles Multer errors, validation errors, etc.)
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+  res.status(err.status || 400).json({
+    success: false,
+    message: err.message || "An unexpected error occurred"
+  });
+});
+
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-});
+});
