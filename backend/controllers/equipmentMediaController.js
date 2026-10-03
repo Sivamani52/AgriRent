@@ -34,6 +34,15 @@ export const uploadEquipmentMedia = async (req, res) => {
     try {
         const { equipmentId } = req.params;
 
+        const equipmentIdNumber = Number(equipmentId);
+
+        if (!Number.isInteger(equipmentIdNumber) || equipmentIdNumber <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid equipment ID"
+            });
+        }
+
         // 1. Verify file was provided
         if (!req.file) {
             return res.status(400).json({
@@ -45,7 +54,7 @@ export const uploadEquipmentMedia = async (req, res) => {
         // 2. Verify that equipment exists in the database
         const [equipment] = await pool.query(
             "SELECT id FROM equipment WHERE id = ?",
-            [equipmentId]
+            [equipmentIdNumber]
         );
 
         if (equipment.length === 0) {
@@ -97,9 +106,16 @@ export const uploadEquipmentMedia = async (req, res) => {
 
         // 6. Store Cloudinary secure_url in MySQL equipment_media table
         const [insertResult] = await pool.query(
-            `INSERT INTO equipment_media (equipment_id, media_type, file_url, uploaded_by)
-             VALUES (?, ?, ?, ?)`,
-            [equipmentId, mediaType, result.secure_url, uploadedBy]
+            `INSERT INTO equipment_media
+            (equipment_id, media_type, file_url, public_id, uploaded_by)
+            VALUES (?, ?, ?, ?, ?)`,
+            [
+                equipmentIdNumber,
+                mediaType,
+                result.secure_url,
+                result.public_id,
+                uploadedBy
+            ]
         );
 
         // 7. Return generated Cloudinary URL and record in the response
@@ -120,6 +136,133 @@ export const uploadEquipmentMedia = async (req, res) => {
         return res.status(500).json({
             success: false,
             message: "Failed to upload media"
+        });
+    }
+};
+
+
+export const getEquipmentMedia = async (req, res) => {
+    try {
+        const { equipmentId } = req.params;
+        const equipmentIdNumber = Number(equipmentId);
+
+        if (!Number.isInteger(equipmentIdNumber) || equipmentIdNumber <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid equipment ID"
+            });
+        }
+
+        const [equipment] = await pool.query(
+            "SELECT id FROM equipment WHERE id = ?",
+            [equipmentIdNumber]
+        );
+
+        if (equipment.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Equipment not found"
+            });
+        }
+
+        const [media] = await pool.query(
+            `SELECT
+                id,
+                equipment_id,
+                media_type,
+                file_url,
+                public_id,
+                uploaded_by,
+                created_at
+            FROM equipment_media
+            WHERE equipment_id = ?
+            ORDER BY created_at DESC`,
+            [equipmentId]
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Equipment media fetched successfully",
+            data: media
+        });
+
+    } catch (error) {
+        console.error("Get equipment media error:", error.message || error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch equipment media"
+        });
+    }
+};
+
+export const deleteEquipmentMedia = async (req, res) => {
+    try {
+        const { equipmentId, mediaId } = req.params;
+        const equipmentIdNum = Number(equipmentId);
+        const mediaIdNum = Number(mediaId);
+
+        if (!Number.isInteger(equipmentIdNum) || equipmentIdNum <= 0 || !Number.isInteger(mediaIdNum) || mediaIdNum <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid equipment ID or media ID"
+            });
+        }
+
+        const [media] = await pool.query(
+            `SELECT
+                id,
+                public_id,
+                file_url,
+                media_type
+             FROM equipment_media
+             WHERE id = ? AND equipment_id = ?`,
+            [mediaIdNum, equipmentIdNum]
+        );
+
+        if (media.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Media not found for this equipment"
+            });
+        }
+
+        const mediaData = media[0];
+
+        // Delete from Cloudinary
+        if (mediaData.public_id) {
+            const resourceType =
+                mediaData.media_type === "VIDEO" ? "video" : "image";
+
+            await cloudinary.uploader.destroy(
+                mediaData.public_id,
+                {
+                    resource_type: resourceType
+                }
+            );
+        }
+
+        // Delete from MySQL
+        await pool.query(
+            `DELETE FROM equipment_media
+             WHERE id = ? AND equipment_id = ?`,
+            [mediaIdNum, equipmentIdNum]
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Media deleted successfully"
+        });
+
+    } catch (error) {
+        console.error(
+            "Delete equipment media error:",
+            error.message || error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to delete media"
         });
     }
 };

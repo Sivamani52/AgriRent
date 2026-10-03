@@ -9,12 +9,16 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-cloudinary.api.ping()
-    .then(() => {
-        console.log("✅ Cloudinary connected successfully");
-    })
-    .catch((error) => {
-        console.error("❌ Cloudinary connection failed:", error.message);
-    });
+if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+    cloudinary.api.ping()
+        .then(() => {
+            console.log("✅ Cloudinary connected successfully");
+        })
+        .catch((error) => {
+            console.error("❌ Cloudinary connection failed:", error.message);
+        });
+} else {
+    console.warn("⚠️ Cloudinary credentials missing or incomplete in environment variables");
+}
 
 export default cloudinary;

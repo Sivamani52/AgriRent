@@ -3,6 +3,8 @@ import express from "express";
 import cors from "cors";
 import db from "./db.js";
 import equipmentMediaRoutes from "./routes/equipmentMediaRoutes.js";
+import equipmentRoutes from "./routes/equipmentRoutes.js";
+import equipmentCategoryRoutes from "./routes/equipmentCategoryRoutes.js";
 
 const app = express();
 
@@ -11,6 +13,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.use("/api", equipmentMediaRoutes);
+app.use("/api", equipmentRoutes);
+app.use("/api", equipmentCategoryRoutes);
 
 app.get("/", (req, res) => {
   res.json({
@@ -41,4 +45,4 @@ const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-});
+});
