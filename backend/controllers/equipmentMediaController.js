@@ -266,3 +266,63 @@ export const deleteEquipmentMedia = async (req, res) => {
         });
     }
 };
+
+
+export const getOwnerEquipmentMedia = async (req, res) => {
+    try {
+        const { ownerId } = req.params;
+
+        const [owner] = await pool.query(
+            `SELECT id
+             FROM owners
+             WHERE id = ?`,
+            [ownerId]
+        );
+
+        if (owner.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Owner not found"
+            });
+        }
+
+        const [media] = await pool.query(
+            `SELECT
+                em.id,
+                em.equipment_id,
+                e.name AS equipment_name,
+                e.category_id,
+                c.name AS category_name,
+                em.media_type,
+                em.file_url,
+                em.public_id,
+                em.created_at
+             FROM equipment_media em
+             JOIN equipment e
+                 ON em.equipment_id = e.id
+             JOIN equipment_categories c
+                 ON e.category_id = c.id
+             WHERE e.owner_id = ?
+             ORDER BY em.created_at DESC`,
+            [ownerId]
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Owner equipment media fetched successfully",
+            count: media.length,
+            data: media
+        });
+
+    } catch (error) {
+        console.error(
+            "Get owner equipment media error:",
+            error.message || error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch owner equipment media"
+        });
+    }
+};

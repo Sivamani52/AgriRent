@@ -8,7 +8,8 @@ import {
     createEquipment,
     updateEquipment,
     deleteEquipment,
-    searchEquipment
+    searchEquipment,
+    getEquipmentByOwner
 } from "../controllers/equipmentController.js";
 
 const router = express.Router();
@@ -21,6 +22,11 @@ router.patch(
 router.get(
     "/equipment/search",
     searchEquipment
+);
+
+router.get(
+    "/equipment/owner/:ownerId",
+    getEquipmentByOwner
 );
 
 router.get(

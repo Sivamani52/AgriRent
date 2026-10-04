@@ -5,6 +5,7 @@ import db from "./db.js";
 import equipmentMediaRoutes from "./routes/equipmentMediaRoutes.js";
 import equipmentRoutes from "./routes/equipmentRoutes.js";
 import equipmentCategoryRoutes from "./routes/equipmentCategoryRoutes.js";
+import bookingRoutes from "./routes/bookingRoutes.js";
 
 const app = express();
 
@@ -15,6 +16,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use("/api", equipmentMediaRoutes);
 app.use("/api", equipmentRoutes);
 app.use("/api", equipmentCategoryRoutes);
+app.use("/api", bookingRoutes);
 
 app.get("/", (req, res) => {
   res.json({

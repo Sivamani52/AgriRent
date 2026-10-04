@@ -244,18 +244,18 @@ export const createEquipment = async (req, res) => {
             owner_id,
             location_id,
             name,
+            category_id,
             equipment_type,
             description,
             price_per_hour,
             price_per_day
         } = req.body;
 
-        if (
-            !owner_id ||
-            !location_id ||
-            !name ||
-            !equipment_type
-        ) {
+        if (    !owner_id ||
+                !location_id ||
+                !name ||
+                 !category_id
+            ) {
             return res.status(400).json({
                 success: false,
                 message: "owner_id, location_id, name and equipment_type are required"
@@ -286,24 +286,38 @@ export const createEquipment = async (req, res) => {
             });
         }
 
+         const [category] = await pool.query(
+                "SELECT id FROM equipment_categories WHERE id = ? AND status = 'ACTIVE'",
+                [category_id]
+            );
+
+        if (category.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Equipment category not found or inactive"
+                });
+        }
+
         const [result] = await pool.query(
             `INSERT INTO equipment (
-                owner_id,
-                location_id,
-                name,
-                equipment_type,
-                description,
-                price_per_hour,
-                price_per_day,
-                status,
-                verification_status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'UNDER_INSPECTION', 'PENDING')`,
+                    owner_id,
+                    location_id,
+                    name,
+                    category_id,
+                    equipment_type,
+                    description,
+                    price_per_hour,
+                    price_per_day,
+                    status,
+                    verification_status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'UNDER_INSPECTION', 'PENDING')`,
             [
                 owner_id,
                 location_id,
                 name,
-                equipment_type,
+                category_id,
+                equipment_type || null,
                 description || null,
                 price_per_hour || null,
                 price_per_day || null
@@ -520,7 +534,8 @@ export const deleteEquipment = async (req, res) => {
 
 export const searchEquipment = async (req, res) => {
     try {
-        const {
+       const {
+            category_id,
             equipment_type,
             location_id,
             min_price_per_day,
@@ -530,49 +545,58 @@ export const searchEquipment = async (req, res) => {
 
         let query = `
             SELECT
-                id,
-                owner_id,
-                location_id,
-                name,
-                equipment_type,
-                description,
-                price_per_hour,
-                price_per_day,
-                status,
-                verification_status
-            FROM equipment
-            WHERE status = 'AVAILABLE'
-            AND verification_status = 'VERIFIED'
+                e.id,
+                e.owner_id,
+                e.location_id,
+                e.name,
+                e.category_id,
+                c.name AS category_name,
+                e.equipment_type,
+                e.description,
+                e.price_per_hour,
+                e.price_per_day,
+                e.status,
+                e.verification_status
+            FROM equipment e
+            JOIN equipment_categories c
+                ON e.category_id = c.id
+            WHERE e.status = 'AVAILABLE'
+            AND e.verification_status = 'VERIFIED'
         `;
 
         const values = [];
 
+        if (category_id) {
+            query += ` AND e.category_id = ?`;
+            values.push(category_id);
+        }
+
         if (equipment_type) {
-            query += ` AND equipment_type = ?`;
+            query += ` AND e.equipment_type = ?`;
             values.push(equipment_type);
         }
 
         if (location_id) {
-            query += ` AND location_id = ?`;
+            query += ` AND e.location_id = ?`;
             values.push(location_id);
         }
 
         if (min_price_per_day !== undefined) {
-            query += ` AND price_per_day >= ?`;
+            query += ` AND e.price_per_day >= ?`;
             values.push(min_price_per_day);
         }
 
         if (max_price_per_day !== undefined) {
-            query += ` AND price_per_day <= ?`;
+            query += ` AND e.price_per_day <= ?`;
             values.push(max_price_per_day);
         }
 
         if (name) {
-            query += ` AND name LIKE ?`;
+            query += ` AND e.name LIKE ?`;
             values.push(`%${name}%`);
         }
 
-        query += ` ORDER BY created_at DESC`;
+        query += ` ORDER BY e.created_at DESC`;
 
         const [equipment] = await pool.query(query, values);
 
@@ -592,6 +616,71 @@ export const searchEquipment = async (req, res) => {
         return res.status(500).json({
             success: false,
             message: "Failed to search equipment"
+        });
+    }
+};
+
+
+export const getEquipmentByOwner = async (req, res) => {
+    try {
+        const { ownerId } = req.params;
+
+        const [owner] = await pool.query(
+            `SELECT id
+             FROM owners
+             WHERE id = ?`,
+            [ownerId]
+        );
+
+        if (owner.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Owner not found"
+            });
+        }
+
+        const [equipment] = await pool.query(
+            `SELECT
+                e.id,
+                e.owner_id,
+                e.location_id,
+                e.name,
+                e.category_id,
+                c.name AS category_name,
+                e.equipment_type,
+                e.description,
+                e.price_per_hour,
+                e.price_per_day,
+                e.status,
+                e.verification_status,
+                e.verified_by,
+                e.verified_at,
+                e.created_at,
+                e.updated_at
+             FROM equipment e
+             JOIN equipment_categories c
+                 ON e.category_id = c.id
+             WHERE e.owner_id = ?
+             ORDER BY e.created_at DESC`,
+            [ownerId]
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Owner equipment fetched successfully",
+            count: equipment.length,
+            data: equipment
+        });
+
+    } catch (error) {
+        console.error(
+            "Get owner equipment error:",
+            error.message || error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch owner equipment"
         });
     }
 };
