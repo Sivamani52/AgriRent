@@ -6,6 +6,7 @@ import equipmentMediaRoutes from "./routes/equipmentMediaRoutes.js";
 import equipmentRoutes from "./routes/equipmentRoutes.js";
 import equipmentCategoryRoutes from "./routes/equipmentCategoryRoutes.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
+import paymentRoutes from "./routes/paymentRoutes.js";
 
 const app = express();
 
@@ -17,6 +18,7 @@ app.use("/api", equipmentMediaRoutes);
 app.use("/api", equipmentRoutes);
 app.use("/api", equipmentCategoryRoutes);
 app.use("/api", bookingRoutes);
+app.use("/api", paymentRoutes);
 
 app.get("/", (req, res) => {
   res.json({
