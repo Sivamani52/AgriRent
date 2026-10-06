@@ -188,3 +188,359 @@ export const createBooking = async (req, res) => {
         });
     }
 };
+
+export const acceptBooking = async (req, res) => {
+    try {
+        const { bookingId } = req.params;
+
+        const [bookings] = await pool.query(
+            `SELECT
+                b.id,
+                b.equipment_id,
+                b.status,
+                e.status AS equipment_status
+             FROM bookings b
+             JOIN equipment e ON b.equipment_id = e.id
+             WHERE b.id = ?`,
+            [bookingId]
+        );
+
+        if (bookings.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Booking not found"
+            });
+        }
+
+        const booking = bookings[0];
+
+        if (booking.status !== "PENDING") {
+            return res.status(400).json({
+                success: false,
+                message: "Only pending bookings can be accepted"
+            });
+        }
+
+        if (booking.equipment_status !== "AVAILABLE") {
+            return res.status(400).json({
+                success: false,
+                message: "Equipment is no longer available"
+            });
+        }
+
+        await pool.query(
+            `UPDATE bookings
+             SET status = 'ACCEPTED'
+             WHERE id = ?`,
+            [bookingId]
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Booking accepted successfully",
+            data: {
+                bookingId: Number(bookingId),
+                status: "ACCEPTED"
+            }
+        });
+
+    } catch (error) {
+        console.error(
+            "Accept booking error:",
+            error.message || error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to accept booking"
+        });
+    }
+};
+
+export const rejectBooking = async (req, res) => {
+    try {
+        const { bookingId } = req.params;
+        const { reason } = req.body;
+
+        if (!reason || reason.trim() === "") {
+            return res.status(400).json({
+                success: false,
+                message: "Rejection reason is required"
+            });
+        }
+
+        const [bookings] = await pool.query(
+            `SELECT id, status
+             FROM bookings
+             WHERE id = ?`,
+            [bookingId]
+        );
+
+        if (bookings.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Booking not found"
+            });
+        }
+
+        const booking = bookings[0];
+
+        if (booking.status !== "PENDING") {
+            return res.status(400).json({
+                success: false,
+                message: "Only pending bookings can be rejected"
+            });
+        }
+
+        await pool.query(
+            `UPDATE bookings
+             SET status = 'REJECTED',
+                 cancellation_reason = ?
+             WHERE id = ?`,
+            [reason.trim(), bookingId]
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Booking rejected successfully",
+            data: {
+                bookingId: Number(bookingId),
+                status: "REJECTED",
+                reason: reason.trim()
+            }
+        });
+
+    } catch (error) {
+        console.error(
+            "Reject booking error:",
+            error.message || error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to reject booking"
+        });
+    }
+};
+
+export const getBookingById = async (req, res) => {
+    try {
+        const { bookingId } = req.params;
+
+        const [bookings] = await pool.query(
+            `SELECT
+                b.id AS booking_id,
+                b.start_date,
+                b.end_date,
+                b.price_per_day,
+                b.total_amount,
+                b.advance_amount,
+                b.status,
+                b.cancellation_reason,
+                b.created_at,
+
+                e.id AS equipment_id,
+                e.name AS equipment_name,
+                e.equipment_type,
+
+                f.id AS farmer_id,
+                u.full_name AS farmer_name,
+                u.phone AS farmer_phone,
+
+                o.id AS owner_id,
+                ou.full_name AS owner_name,
+                ou.phone AS owner_phone
+
+             FROM bookings b
+
+             JOIN equipment e
+                ON b.equipment_id = e.id
+
+             JOIN farmers f
+                ON b.farmer_id = f.id
+
+             JOIN users u
+                ON f.user_id = u.id
+
+             JOIN owners o
+                ON e.owner_id = o.id
+
+             JOIN users ou
+                ON o.user_id = ou.id
+
+             WHERE b.id = ?`,
+            [bookingId]
+        );
+
+        if (bookings.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Booking not found"
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: bookings[0]
+        });
+
+    } catch (error) {
+        console.error(
+            "Get booking by ID error:",
+            error.message || error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to get booking"
+        });
+    }
+};
+
+export const getFarmerBookings = async (req, res) => {
+    try {
+        const { farmerId } = req.params;
+
+        const [farmer] = await pool.query(
+            `SELECT id
+             FROM farmers
+             WHERE id = ?`,
+            [farmerId]
+        );
+
+        if (farmer.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Farmer not found"
+            });
+        }
+
+        const [bookings] = await pool.query(
+            `SELECT
+                b.id AS booking_id,
+                b.start_date,
+                b.end_date,
+                b.price_per_day,
+                b.total_amount,
+                b.advance_amount,
+                b.status,
+                b.cancellation_reason,
+                b.created_at,
+
+                e.id AS equipment_id,
+                e.name AS equipment_name,
+                e.equipment_type,
+
+                o.id AS owner_id,
+                ou.full_name AS owner_name,
+                ou.phone AS owner_phone
+
+             FROM bookings b
+
+             JOIN equipment e
+                ON b.equipment_id = e.id
+
+             JOIN owners o
+                ON e.owner_id = o.id
+
+             JOIN users ou
+                ON o.user_id = ou.id
+
+             WHERE b.farmer_id = ?
+
+             ORDER BY b.created_at DESC`,
+            [farmerId]
+        );
+
+        return res.status(200).json({
+            success: true,
+            count: bookings.length,
+            data: bookings
+        });
+
+    } catch (error) {
+        console.error(
+            "Get farmer bookings error:",
+            error.message || error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to get farmer bookings"
+        });
+    }
+};
+
+export const getOwnerBookings = async (req, res) => {
+    try {
+        const { ownerId } = req.params;
+
+        const [owner] = await pool.query(
+            `SELECT id
+             FROM owners
+             WHERE id = ?`,
+            [ownerId]
+        );
+
+        if (owner.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Owner not found"
+            });
+        }
+
+        const [bookings] = await pool.query(
+            `SELECT
+                b.id AS booking_id,
+                b.start_date,
+                b.end_date,
+                b.price_per_day,
+                b.total_amount,
+                b.advance_amount,
+                b.status,
+                b.cancellation_reason,
+                b.created_at,
+
+                e.id AS equipment_id,
+                e.name AS equipment_name,
+                e.equipment_type,
+
+                f.id AS farmer_id,
+                fu.full_name AS farmer_name,
+                fu.phone AS farmer_phone
+
+             FROM bookings b
+
+             JOIN equipment e
+                ON b.equipment_id = e.id
+
+             JOIN farmers f
+                ON b.farmer_id = f.id
+
+             JOIN users fu
+                ON f.user_id = fu.id
+
+             WHERE e.owner_id = ?
+
+             ORDER BY b.created_at DESC`,
+            [ownerId]
+        );
+
+        return res.status(200).json({
+            success: true,
+            count: bookings.length,
+            data: bookings
+        });
+
+    } catch (error) {
+        console.error(
+            "Get owner bookings error:",
+            error.message || error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to get owner bookings"
+        });
+    }
+};
