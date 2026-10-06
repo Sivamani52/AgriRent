@@ -228,12 +228,17 @@ export const acceptBooking = async (req, res) => {
             });
         }
 
-        await pool.query(
-            `UPDATE bookings
-             SET status = 'ACCEPTED'
-             WHERE id = ?`,
-            [bookingId]
-        );
+            const paymentDeadline = new Date(
+                Date.now() + 6 * 60 * 60 * 1000
+            );
+
+            await pool.query(
+                `UPDATE bookings
+                SET status = 'ACCEPTED',
+                    payment_deadline = ?
+                WHERE id = ?`,
+                [paymentDeadline, bookingId]
+            );
 
         return res.status(200).json({
             success: true,
