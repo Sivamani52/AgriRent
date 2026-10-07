@@ -272,3 +272,95 @@ export const rejectPayment = async (req, res) => {
         });
     }
 };
+
+export const submitRefund = async (req, res) => {
+    try {
+        const { paymentId } = req.params;
+        const { refund_transaction_id } = req.body;
+
+        if (!refund_transaction_id || refund_transaction_id.trim() === "") {
+            return res.status(400).json({
+                success: false,
+                message: "Refund transaction ID is required"
+            });
+        }
+
+        const [payments] = await pool.query(
+            `SELECT
+                id,
+                booking_id,
+                amount,
+                status,
+                refund_deadline,
+                (refund_deadline > NOW()) AS refund_window_open
+            FROM booking_payments
+            WHERE id = ?`,
+            [paymentId]
+        );
+
+        if (payments.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Payment not found"
+            });
+        }
+
+        const payment = payments[0];
+
+        if (payment.status !== "PAYMENT_REJECTED") {
+            return res.status(400).json({
+                success: false,
+                message: "Refund can only be submitted for a rejected payment"
+            });
+        }
+
+        if (!payment.refund_deadline) {
+            return res.status(400).json({
+                success: false,
+                message: "Refund deadline is not available"
+            });
+        }
+
+        if (!payment.refund_window_open) {
+            return res.status(400).json({
+                success: false,
+                message: "Refund deadline has expired. Area Admin will handle the refund."
+            });
+        }
+
+        await pool.query(
+            `UPDATE booking_payments
+             SET refund_transaction_id = ?,
+                 refund_submitted_at = NOW()
+             WHERE id = ?`,
+            [
+                refund_transaction_id.trim(),
+                paymentId
+            ]
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Refund details submitted successfully. Waiting for verification.",
+            data: {
+                paymentId: Number(paymentId),
+                bookingId: payment.booking_id,
+                refundAmount: Number(payment.amount),
+                refundTransactionId: refund_transaction_id.trim(),
+                refundSubmittedAt: new Date(),
+                status: "PAYMENT_REJECTED"
+            }
+        });
+
+    } catch (error) {
+        console.error(
+            "Submit refund error:",
+            error.message || error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to submit refund"
+        });
+    }
+};

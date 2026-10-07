@@ -7,6 +7,7 @@ import equipmentRoutes from "./routes/equipmentRoutes.js";
 import equipmentCategoryRoutes from "./routes/equipmentCategoryRoutes.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
+import { checkPaymentVerificationTimeouts } from "./services/paymentTimeoutService.js";
 
 const app = express();
 
@@ -46,6 +47,13 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5000;
+
+setInterval(
+    checkPaymentVerificationTimeouts,
+    60 * 1000
+);
+
+checkPaymentVerificationTimeouts();
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
