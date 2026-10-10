@@ -198,6 +198,8 @@ export const acceptBooking = async (req, res) => {
                 b.id,
                 b.equipment_id,
                 b.status,
+                b.created_at,
+                (b.created_at <= DATE_SUB(NOW(), INTERVAL 4 HOUR)) AS is_expired,
                 e.status AS equipment_status
              FROM bookings b
              JOIN equipment e ON b.equipment_id = e.id
@@ -221,6 +223,22 @@ export const acceptBooking = async (req, res) => {
             });
         }
 
+        if (booking.is_expired) {
+            await pool.query(
+                `UPDATE bookings
+                 SET status = 'CANCELLED',
+                     cancellation_reason = 'Owner did not respond within the 4-hour deadline',
+                     cancelled_at = NOW()
+                 WHERE id = ? AND status = 'PENDING'`,
+                [bookingId]
+            );
+
+            return res.status(400).json({
+                success: false,
+                message: "Booking acceptance deadline has expired. This booking has been cancelled."
+            });
+        }
+
         if (booking.equipment_status !== "AVAILABLE") {
             return res.status(400).json({
                 success: false,
@@ -228,17 +246,17 @@ export const acceptBooking = async (req, res) => {
             });
         }
 
-            const paymentDeadline = new Date(
-                Date.now() + 6 * 60 * 60 * 1000
-            );
+        const paymentDeadline = new Date(
+            Date.now() + 6 * 60 * 60 * 1000
+        );
 
-            await pool.query(
-                `UPDATE bookings
-                SET status = 'ACCEPTED',
-                    payment_deadline = ?
-                WHERE id = ?`,
-                [paymentDeadline, bookingId]
-            );
+        await pool.query(
+            `UPDATE bookings
+            SET status = 'ACCEPTED',
+                payment_deadline = ?
+            WHERE id = ?`,
+            [paymentDeadline, bookingId]
+        );
 
         return res.status(200).json({
             success: true,
@@ -275,7 +293,8 @@ export const rejectBooking = async (req, res) => {
         }
 
         const [bookings] = await pool.query(
-            `SELECT id, status
+            `SELECT id, status,
+                    (created_at <= DATE_SUB(NOW(), INTERVAL 4 HOUR)) AS is_expired
              FROM bookings
              WHERE id = ?`,
             [bookingId]
@@ -294,6 +313,22 @@ export const rejectBooking = async (req, res) => {
             return res.status(400).json({
                 success: false,
                 message: "Only pending bookings can be rejected"
+            });
+        }
+
+        if (booking.is_expired) {
+            await pool.query(
+                `UPDATE bookings
+                 SET status = 'CANCELLED',
+                     cancellation_reason = 'Owner did not respond within the 4-hour deadline',
+                     cancelled_at = NOW()
+                 WHERE id = ? AND status = 'PENDING'`,
+                [bookingId]
+            );
+
+            return res.status(400).json({
+                success: false,
+                message: "Booking acceptance deadline has expired. This booking has been cancelled."
             });
         }
 

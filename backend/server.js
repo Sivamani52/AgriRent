@@ -7,7 +7,11 @@ import equipmentRoutes from "./routes/equipmentRoutes.js";
 import equipmentCategoryRoutes from "./routes/equipmentCategoryRoutes.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
-import { checkPaymentVerificationTimeouts } from "./services/paymentTimeoutService.js";
+import adminRoutes from "./routes/adminRoutes.js";
+import { 
+    checkPaymentVerificationTimeouts, 
+    checkBookingAcceptanceTimeouts 
+} from "./services/paymentTimeoutService.js";
 
 const app = express();
 
@@ -20,6 +24,7 @@ app.use("/api", equipmentRoutes);
 app.use("/api", equipmentCategoryRoutes);
 app.use("/api", bookingRoutes);
 app.use("/api", paymentRoutes);
+app.use("/api", adminRoutes);
 
 app.get("/", (req, res) => {
   res.json({
@@ -48,12 +53,13 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 5000;
 
-setInterval(
-    checkPaymentVerificationTimeouts,
-    60 * 1000
-);
+const runTimeoutChecks = async () => {
+    await checkPaymentVerificationTimeouts();
+    await checkBookingAcceptanceTimeouts();
+};
 
-checkPaymentVerificationTimeouts();
+setInterval(runTimeoutChecks, 60 * 1000);
+runTimeoutChecks();
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
