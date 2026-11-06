@@ -17,7 +17,21 @@ export const authenticateUser = async (req, res, next) => {
         }
 
         const token = authHeader.split(" ")[1];
-        const secret = process.env.JWT_SECRET || "agrirent_secret_key";
+        if (!token) {
+            return res.status(401).json({
+                success: false,
+                message: "Authentication token is missing or invalid"
+            });
+        }
+
+        const secret = process.env.JWT_SECRET;
+        if (!secret) {
+            console.error("JWT_SECRET is not configured");
+            return res.status(500).json({
+                success: false,
+                message: "Authentication service is not configured"
+            });
+        }
 
         let decoded;
         try {
@@ -31,6 +45,12 @@ export const authenticateUser = async (req, res, next) => {
 
         // Verify that the user exists and is active in the database
         const userId = decoded.id || decoded.userId;
+        if (!userId) {
+            return res.status(401).json({
+                success: false,
+                message: "User account not found"
+            });
+        }
         const [users] = await pool.query(
             "SELECT id, full_name, email, role, status FROM users WHERE id = ?",
             [userId]

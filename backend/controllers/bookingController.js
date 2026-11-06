@@ -11,27 +11,78 @@ export const createBooking = async (req, res) => {
 
         if (
             !equipment_id ||
-            !farmer_id ||
             !start_date ||
-            !end_date
+            !end_date ||
+            (req.user.role === "AREA_ADMIN" && !farmer_id)
         ) {
             return res.status(400).json({
                 success: false,
-                message: "equipment_id, farmer_id, start_date and end_date are required"
+                message: req.user.role === "AREA_ADMIN"
+                    ? "equipment_id, farmer_id, start_date and end_date are required"
+                    : "equipment_id, start_date and end_date are required"
             });
         }
 
-        const [farmer] = await pool.query(
-            `SELECT id
-             FROM farmers
-             WHERE id = ?`,
-            [farmer_id]
-        );
+        let effectiveFarmerId;
 
-        if (farmer.length === 0) {
-            return res.status(404).json({
+        // Role-based farmer resolution and ownership check
+        if (req.user.role === "FARMER") {
+            const [farmerRows] = await pool.query(
+                `SELECT id, location_id
+                 FROM farmers
+                 WHERE user_id = ?`,
+                [req.user.id]
+            );
+
+            if (farmerRows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Farmer profile not found for authenticated user"
+                });
+            }
+
+            effectiveFarmerId = farmerRows[0].id;
+
+            // Reject if farmer attempts to specify a different farmer's ID
+            if (farmer_id && Number(farmer_id) !== effectiveFarmerId) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You cannot create a booking on behalf of another farmer"
+                });
+            }
+        } else if (req.user.role === "AREA_ADMIN") {
+            // Assisted booking: Area Admin booking on behalf of a farmer
+            const [farmerRows] = await pool.query(
+                `SELECT id, location_id
+                 FROM farmers
+                 WHERE id = ?`,
+                [farmer_id]
+            );
+
+            if (farmerRows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Farmer not found"
+                });
+            }
+
+            const assistedFarmer = farmerRows[0];
+            effectiveFarmerId = assistedFarmer.id;
+
+            // Restrict Area Admin to assigned area
+            const adminLocationId = req.user.location_id;
+            if (adminLocationId) {
+                if (assistedFarmer.location_id && assistedFarmer.location_id !== adminLocationId) {
+                    return res.status(403).json({
+                        success: false,
+                        message: "Area Admin cannot create bookings for farmers outside their assigned area"
+                    });
+                }
+            }
+        } else {
+            return res.status(403).json({
                 success: false,
-                message: "Farmer not found"
+                message: "You are not authorized to create bookings"
             });
         }
 
@@ -40,7 +91,9 @@ export const createBooking = async (req, res) => {
                 id,
                 price_per_day,
                 status,
-                verification_status
+                verification_status,
+                location_id,
+                owner_id
              FROM equipment
              WHERE id = ?`,
             [equipment_id]
@@ -54,6 +107,16 @@ export const createBooking = async (req, res) => {
         }
 
         const selectedEquipment = equipment[0];
+
+        // Restrict Area Admin from booking equipment outside their assigned area
+        if (req.user.role === "AREA_ADMIN" && req.user.location_id) {
+            if (selectedEquipment.location_id && selectedEquipment.location_id !== req.user.location_id) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Area Admin cannot book equipment outside their assigned area"
+                });
+            }
+        }
 
         if (selectedEquipment.verification_status !== "VERIFIED") {
             return res.status(400).json({
@@ -150,7 +213,7 @@ export const createBooking = async (req, res) => {
             VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
             [
                 equipment_id,
-                farmer_id,
+                effectiveFarmerId,
                 start_date,
                 end_date,
                 pricePerDay,
@@ -165,7 +228,7 @@ export const createBooking = async (req, res) => {
             data: {
                 bookingId: result.insertId,
                 equipmentId: Number(equipment_id),
-                farmerId: Number(farmer_id),
+                farmerId: Number(effectiveFarmerId),
                 startDate: start_date,
                 endDate: end_date,
                 rentalDays,
@@ -193,6 +256,23 @@ export const acceptBooking = async (req, res) => {
     try {
         const { bookingId } = req.params;
 
+        // Retrieve authenticated owner profile
+        const [ownerRows] = await pool.query(
+            `SELECT id
+             FROM owners
+             WHERE user_id = ?`,
+            [req.user.id]
+        );
+
+        if (ownerRows.length === 0) {
+            return res.status(403).json({
+                success: false,
+                message: "Owner profile not found"
+            });
+        }
+
+        const authenticatedOwnerId = ownerRows[0].id;
+
         const [bookings] = await pool.query(
             `SELECT
                 b.id,
@@ -200,7 +280,8 @@ export const acceptBooking = async (req, res) => {
                 b.status,
                 b.created_at,
                 (b.created_at <= DATE_SUB(NOW(), INTERVAL 4 HOUR)) AS is_expired,
-                e.status AS equipment_status
+                e.status AS equipment_status,
+                e.owner_id
              FROM bookings b
              JOIN equipment e ON b.equipment_id = e.id
              WHERE b.id = ?`,
@@ -215,6 +296,14 @@ export const acceptBooking = async (req, res) => {
         }
 
         const booking = bookings[0];
+
+        // Equipment ownership validation: Owner can only accept bookings for their own equipment
+        if (booking.owner_id !== authenticatedOwnerId) {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to accept bookings for equipment you do not own"
+            });
+        }
 
         if (booking.status !== "PENDING") {
             return res.status(400).json({
@@ -292,11 +381,32 @@ export const rejectBooking = async (req, res) => {
             });
         }
 
+        // Retrieve authenticated owner profile
+        const [ownerRows] = await pool.query(
+            `SELECT id
+             FROM owners
+             WHERE user_id = ?`,
+            [req.user.id]
+        );
+
+        if (ownerRows.length === 0) {
+            return res.status(403).json({
+                success: false,
+                message: "Owner profile not found"
+            });
+        }
+
+        const authenticatedOwnerId = ownerRows[0].id;
+
         const [bookings] = await pool.query(
-            `SELECT id, status,
-                    (created_at <= DATE_SUB(NOW(), INTERVAL 4 HOUR)) AS is_expired
-             FROM bookings
-             WHERE id = ?`,
+            `SELECT
+                b.id,
+                b.status,
+                (b.created_at <= DATE_SUB(NOW(), INTERVAL 4 HOUR)) AS is_expired,
+                e.owner_id
+             FROM bookings b
+             JOIN equipment e ON b.equipment_id = e.id
+             WHERE b.id = ?`,
             [bookingId]
         );
 
@@ -308,6 +418,14 @@ export const rejectBooking = async (req, res) => {
         }
 
         const booking = bookings[0];
+
+        // Equipment ownership validation: Owner can only reject bookings for their own equipment
+        if (booking.owner_id !== authenticatedOwnerId) {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to reject bookings for equipment you do not own"
+            });
+        }
 
         if (booking.status !== "PENDING") {
             return res.status(400).json({
@@ -382,12 +500,17 @@ export const getBookingById = async (req, res) => {
                 e.id AS equipment_id,
                 e.name AS equipment_name,
                 e.equipment_type,
+                e.location_id AS equipment_location_id,
 
                 f.id AS farmer_id,
+                f.user_id AS farmer_user_id,
+                f.location_id AS farmer_location_id,
                 u.full_name AS farmer_name,
                 u.phone AS farmer_phone,
 
                 o.id AS owner_id,
+                o.user_id AS owner_user_id,
+                o.location_id AS owner_location_id,
                 ou.full_name AS owner_name,
                 ou.phone AS owner_phone
 
@@ -419,9 +542,57 @@ export const getBookingById = async (req, res) => {
             });
         }
 
+        const booking = bookings[0];
+        const { role, id: userId, location_id: adminLocationId } = req.user;
+
+        // Role-based Access and Ownership Validation
+        if (role === "FARMER") {
+            if (booking.farmer_user_id !== userId) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to view this booking"
+                });
+            }
+        } else if (role === "OWNER") {
+            if (booking.owner_user_id !== userId) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to view this booking"
+                });
+            }
+        } else if (role === "AREA_ADMIN") {
+            const matchesArea = adminLocationId && (
+                booking.equipment_location_id === adminLocationId ||
+                booking.farmer_location_id === adminLocationId ||
+                booking.owner_location_id === adminLocationId
+            );
+
+            if (!matchesArea) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to view bookings outside your assigned area"
+                });
+            }
+        } else if (role !== "SUPER_ADMIN") {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to view this booking"
+            });
+        }
+
+        // Strip internal permission validation fields before sending response
+        const {
+            farmer_user_id,
+            owner_user_id,
+            equipment_location_id,
+            farmer_location_id,
+            owner_location_id,
+            ...bookingData
+        } = booking;
+
         return res.status(200).json({
             success: true,
-            data: bookings[0]
+            data: bookingData
         });
 
     } catch (error) {
@@ -441,17 +612,42 @@ export const getFarmerBookings = async (req, res) => {
     try {
         const { farmerId } = req.params;
 
-        const [farmer] = await pool.query(
-            `SELECT id
+        const [farmerRows] = await pool.query(
+            `SELECT id, user_id, location_id
              FROM farmers
              WHERE id = ?`,
             [farmerId]
         );
 
-        if (farmer.length === 0) {
+        if (farmerRows.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: "Farmer not found"
+            });
+        }
+
+        const farmer = farmerRows[0];
+        const { role, id: userId, location_id: adminLocationId } = req.user;
+
+        // Role-based Access and Ownership Check
+        if (role === "FARMER") {
+            if (farmer.user_id !== userId) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to view another farmer's bookings"
+                });
+            }
+        } else if (role === "AREA_ADMIN") {
+            if (!adminLocationId || (farmer.location_id && farmer.location_id !== adminLocationId)) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to view bookings for farmers outside your assigned area"
+                });
+            }
+        } else if (role !== "SUPER_ADMIN") {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to perform this action"
             });
         }
 
@@ -515,17 +711,42 @@ export const getOwnerBookings = async (req, res) => {
     try {
         const { ownerId } = req.params;
 
-        const [owner] = await pool.query(
-            `SELECT id
+        const [ownerRows] = await pool.query(
+            `SELECT id, user_id, location_id
              FROM owners
              WHERE id = ?`,
             [ownerId]
         );
 
-        if (owner.length === 0) {
+        if (ownerRows.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: "Owner not found"
+            });
+        }
+
+        const owner = ownerRows[0];
+        const { role, id: userId, location_id: adminLocationId } = req.user;
+
+        // Role-based Access and Ownership Check
+        if (role === "OWNER") {
+            if (owner.user_id !== userId) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to view another owner's bookings"
+                });
+            }
+        } else if (role === "AREA_ADMIN") {
+            if (!adminLocationId || (owner.location_id && owner.location_id !== adminLocationId)) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to view bookings for owners outside your assigned area"
+                });
+            }
+        } else if (role !== "SUPER_ADMIN") {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to perform this action"
             });
         }
 
