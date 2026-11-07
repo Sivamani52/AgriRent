@@ -72,7 +72,7 @@ export const authenticateUser = async (req, res, next) => {
             });
         }
 
-        // If the user is an AREA_ADMIN, also attach their area_admin profile and location_id
+        // Attach role-specific profile details (id and location_id)
         if (user.role === "AREA_ADMIN") {
             const [adminProfiles] = await pool.query(
                 "SELECT id, location_id FROM area_admins WHERE user_id = ?",
@@ -80,6 +80,20 @@ export const authenticateUser = async (req, res, next) => {
             );
             user.area_admin_id = adminProfiles.length > 0 ? adminProfiles[0].id : null;
             user.location_id = adminProfiles.length > 0 ? adminProfiles[0].location_id : null;
+        } else if (user.role === "OWNER") {
+            const [ownerProfiles] = await pool.query(
+                "SELECT id, location_id FROM owners WHERE user_id = ?",
+                [user.id]
+            );
+            user.owner_id = ownerProfiles.length > 0 ? ownerProfiles[0].id : null;
+            user.location_id = ownerProfiles.length > 0 ? ownerProfiles[0].location_id : null;
+        } else if (user.role === "FARMER") {
+            const [farmerProfiles] = await pool.query(
+                "SELECT id, location_id FROM farmers WHERE user_id = ?",
+                [user.id]
+            );
+            user.farmer_id = farmerProfiles.length > 0 ? farmerProfiles[0].id : null;
+            user.location_id = farmerProfiles.length > 0 ? farmerProfiles[0].location_id : null;
         }
 
         req.user = user;

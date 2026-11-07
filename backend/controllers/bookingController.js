@@ -1,4 +1,9 @@
 import pool from "../db.js";
+import {
+    sendBookingRequestSMS,
+    sendBookingAcceptedSMS,
+    sendBookingRejectedSMS
+} from "../services/smsService.js";
 
 export const createBooking = async (req, res) => {
     try {
@@ -88,14 +93,19 @@ export const createBooking = async (req, res) => {
 
         const [equipment] = await pool.query(
             `SELECT
-                id,
-                price_per_day,
-                status,
-                verification_status,
-                location_id,
-                owner_id
-             FROM equipment
-             WHERE id = ?`,
+                e.id,
+                e.name,
+                e.price_per_day,
+                e.status,
+                e.verification_status,
+                e.location_id,
+                e.owner_id,
+                ou.phone AS owner_phone,
+                ou.full_name AS owner_name
+             FROM equipment e
+             JOIN owners o ON e.owner_id = o.id
+             JOIN users ou ON o.user_id = ou.id
+             WHERE e.id = ?`,
             [equipment_id]
         );
 
@@ -222,6 +232,13 @@ export const createBooking = async (req, res) => {
             ]
         );
 
+        sendBookingRequestSMS({
+            ownerPhone: selectedEquipment.owner_phone,
+            ownerName: selectedEquipment.owner_name,
+            equipmentName: selectedEquipment.name,
+            bookingId: result.insertId
+        }).catch(err => console.error("Booking request SMS error:", err));
+
         return res.status(201).json({
             success: true,
             message: "Booking request created successfully",
@@ -278,12 +295,18 @@ export const acceptBooking = async (req, res) => {
                 b.id,
                 b.equipment_id,
                 b.status,
+                b.advance_amount,
                 b.created_at,
                 (b.created_at <= DATE_SUB(NOW(), INTERVAL 4 HOUR)) AS is_expired,
                 e.status AS equipment_status,
-                e.owner_id
+                e.name AS equipment_name,
+                e.owner_id,
+                fu.phone AS farmer_phone,
+                fu.full_name AS farmer_name
              FROM bookings b
              JOIN equipment e ON b.equipment_id = e.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
              WHERE b.id = ?`,
             [bookingId]
         );
@@ -347,6 +370,14 @@ export const acceptBooking = async (req, res) => {
             [paymentDeadline, bookingId]
         );
 
+        sendBookingAcceptedSMS({
+            farmerPhone: booking.farmer_phone,
+            farmerName: booking.farmer_name,
+            equipmentName: booking.equipment_name,
+            bookingId: Number(bookingId),
+            advanceAmount: booking.advance_amount
+        }).catch(err => console.error("Booking accepted SMS error:", err));
+
         return res.status(200).json({
             success: true,
             message: "Booking accepted successfully",
@@ -403,9 +434,14 @@ export const rejectBooking = async (req, res) => {
                 b.id,
                 b.status,
                 (b.created_at <= DATE_SUB(NOW(), INTERVAL 4 HOUR)) AS is_expired,
-                e.owner_id
+                e.owner_id,
+                e.name AS equipment_name,
+                fu.phone AS farmer_phone,
+                fu.full_name AS farmer_name
              FROM bookings b
              JOIN equipment e ON b.equipment_id = e.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
              WHERE b.id = ?`,
             [bookingId]
         );
@@ -457,6 +493,14 @@ export const rejectBooking = async (req, res) => {
              WHERE id = ?`,
             [reason.trim(), bookingId]
         );
+
+        sendBookingRejectedSMS({
+            farmerPhone: booking.farmer_phone,
+            farmerName: booking.farmer_name,
+            equipmentName: booking.equipment_name,
+            bookingId: Number(bookingId),
+            reason: reason.trim()
+        }).catch(err => console.error("Booking rejected SMS error:", err));
 
         return res.status(200).json({
             success: true,
