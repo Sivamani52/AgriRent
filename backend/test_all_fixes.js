@@ -7,6 +7,7 @@ import equipmentMediaRoutes from "./routes/equipmentMediaRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
+import inspectionRoutes from "./routes/inspectionRoutes.js";
 import {
     checkBookingAcceptanceTimeouts,
     checkPaymentVerificationTimeouts
@@ -20,6 +21,7 @@ app.use("/api", equipmentMediaRoutes);
 app.use("/api", paymentRoutes);
 app.use("/api", bookingRoutes);
 app.use("/api", adminRoutes);
+app.use("/api", inspectionRoutes);
 
 const server = app.listen(0);
 const port = server.address().port;
@@ -564,6 +566,288 @@ async function runTests() {
     globalThis.fetch = originalFetch;
     process.env.FAST2SMS_API_KEY = prevApiKey;
     process.env.SMS_PROVIDER = prevProvider;
+
+    // -------------------------------------------------------------------------
+    // 6. EQUIPMENT INSPECTION AND HANDOVER SYSTEM TESTS
+    // -------------------------------------------------------------------------
+    console.log("\n--- 6. EQUIPMENT INSPECTION AND HANDOVER SYSTEM TESTS ---");
+
+    // Dedicated equipment for clean inspection & handover test
+    const [inspEq] = await pool.query(
+        `INSERT INTO equipment (owner_id, category_id, location_id, name, equipment_type, description, price_per_day, status, verification_status)
+         VALUES (1, 1, 1, 'Harvester Test Pro', 'HARVESTER', 'Inspection test unit', 1200, 'AVAILABLE', 'VERIFIED')`
+    );
+    const inspEqId = inspEq.insertId;
+
+    // 6.1 Cannot submit initial inspection for non-CONFIRMED booking
+    const [pendingBk] = await pool.query(
+        `INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status)
+         VALUES (?, 1, DATE_ADD(NOW(), INTERVAL 40 DAY), DATE_ADD(NOW(), INTERVAL 42 DAY), 500, 1000, 200, 'PENDING')`,
+        [inspEqId]
+    );
+    const resPendingSubmit = await apiRequest(`/bookings/${pendingBk.insertId}/inspections/initial`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: {
+            engine_condition: "GOOD",
+            tyres_condition: "GOOD",
+            body_condition: "GOOD",
+            fuel_level: "FULL"
+        }
+    });
+    assert(resPendingSubmit.status === 400, "Initial inspection rejected for non-CONFIRMED booking", JSON.stringify(resPendingSubmit.data));
+
+    // Create a confirmed booking awaiting initial handover inspection
+    const [s1Bk] = await pool.query(
+        `INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status)
+         VALUES (?, 1, DATE_ADD(NOW(), INTERVAL 30 DAY), DATE_ADD(NOW(), INTERVAL 32 DAY), 500, 1000, 200, 'CONFIRMED')`,
+        [inspEqId]
+    );
+    const s1BookingId = s1Bk.insertId;
+
+    // 6.2 IDOR Prevention: Unauthorized owner or farmer cannot access/submit
+    const resIdorOwner = await apiRequest(`/bookings/${s1BookingId}/inspections/initial`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${owner2Token}` },
+        body: {
+            engine_condition: "GOOD",
+            tyres_condition: "GOOD",
+            body_condition: "GOOD",
+            fuel_level: "FULL"
+        }
+    });
+    assert(resIdorOwner.status === 403, "IDOR check: Unauthorized owner cannot submit inspection for this booking", JSON.stringify(resIdorOwner.data));
+
+    const resIdorFarmer = await apiRequest(`/bookings/${s1BookingId}/inspections/initial`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmer2Token}` },
+        body: {
+            engine_condition: "GOOD",
+            tyres_condition: "GOOD",
+            body_condition: "GOOD",
+            fuel_level: "FULL"
+        }
+    });
+    assert(resIdorFarmer.status === 403, "IDOR check: Unauthorized farmer cannot submit inspection for this booking", JSON.stringify(resIdorFarmer.data));
+
+    // 6.3 Authorized Owner submits initial pre-handover inspection
+    const resOwnerSubmit = await apiRequest(`/bookings/${s1BookingId}/inspections/initial`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: {
+            engine_condition: "EXCELLENT",
+            tyres_condition: "GOOD",
+            body_condition: "EXCELLENT",
+            fuel_level: "FULL",
+            odometer_hours: 150.5,
+            checklist_notes: "Engine oil checked, full tank diesel."
+        }
+    });
+    assert(resOwnerSubmit.status === 200, "Authorized owner records pre-handover initial inspection", JSON.stringify(resOwnerSubmit.data));
+
+    // 6.4 Authorized Farmer submits independent pre-handover inspection
+    const resFarmerSubmit = await apiRequest(`/bookings/${s1BookingId}/inspections/initial`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: {
+            engine_condition: "GOOD",
+            tyres_condition: "GOOD",
+            body_condition: "GOOD",
+            fuel_level: "FULL",
+            odometer_hours: 150.5,
+            checklist_notes: "Verified body and fuel level with owner."
+        }
+    });
+    assert(resFarmerSubmit.status === 200, "Authorized farmer records independent pre-handover inspection", JSON.stringify(resFarmerSubmit.data));
+
+    // 6.5 Owner confirms initial inspection (Partial handshake -> Not finalized)
+    const resOwnerConfirm = await apiRequest(`/bookings/${s1BookingId}/inspections/initial/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    assert(
+        resOwnerConfirm.status === 200 && resOwnerConfirm.data?.data?.handoverFinalized === false,
+        "Owner confirms initial inspection; handover is pending farmer confirmation",
+        JSON.stringify(resOwnerConfirm.data)
+    );
+
+    // 6.6 Farmer confirms initial inspection (Full handshake -> Finalized)
+    const resFarmerConfirm = await apiRequest(`/bookings/${s1BookingId}/inspections/initial/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    assert(
+        resFarmerConfirm.status === 200 && resFarmerConfirm.data?.data?.handoverFinalized === true,
+        "Farmer confirms initial inspection; handover finalized and rental is now ACTIVE",
+        JSON.stringify(resFarmerConfirm.data)
+    );
+
+    // Verify DB states: booking -> IN_PROGRESS, equipment -> IN_USE
+    const [s1BkRow] = await pool.query("SELECT status, handover_completed_at FROM bookings WHERE id = ?", [s1BookingId]);
+    const [s1EqRow] = await pool.query("SELECT status FROM equipment WHERE id = ?", [inspEqId]);
+    assert(
+        s1BkRow[0].status === "IN_PROGRESS" && s1BkRow[0].handover_completed_at !== null && s1EqRow[0].status === "IN_USE",
+        "Booking transitioned to IN_PROGRESS, handover_completed_at recorded, equipment set to IN_USE",
+        `Booking: ${s1BkRow[0].status}, Eq: ${s1EqRow[0].status}`
+    );
+
+    // 6.7 Duplicate confirmation prevention
+    const resDupInitialConfirm = await apiRequest(`/bookings/${s1BookingId}/inspections/initial/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    assert(resDupInitialConfirm.status === 400, "Duplicate initial confirmation rejected with 400", JSON.stringify(resDupInitialConfirm.data));
+
+    // 6.8 Stage 2: Final Return Inspection (Clean return flow)
+    const resFarmerFinalSubmit = await apiRequest(`/bookings/${s1BookingId}/inspections/final`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: {
+            engine_condition: "GOOD",
+            tyres_condition: "GOOD",
+            body_condition: "GOOD",
+            fuel_level: "FULL",
+            odometer_hours: 175.0,
+            checklist_notes: "Returned clean and refueled.",
+            is_damage_reported: false
+        }
+    });
+    assert(resFarmerFinalSubmit.status === 200, "Farmer submits Stage 2 return inspection", JSON.stringify(resFarmerFinalSubmit.data));
+
+    const resOwnerFinalSubmit = await apiRequest(`/bookings/${s1BookingId}/inspections/final`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: {
+            engine_condition: "GOOD",
+            tyres_condition: "GOOD",
+            body_condition: "GOOD",
+            fuel_level: "FULL",
+            odometer_hours: 175.0,
+            checklist_notes: "Equipment returned in good shape. No damages.",
+            is_damage_reported: false
+        }
+    });
+    assert(resOwnerFinalSubmit.status === 200, "Owner submits Stage 2 return inspection", JSON.stringify(resOwnerFinalSubmit.data));
+
+    // Farmer confirms return
+    const resFarmerFinalConfirm = await apiRequest(`/bookings/${s1BookingId}/inspections/final/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    assert(resFarmerFinalConfirm.status === 200 && resFarmerFinalConfirm.data?.data?.returnFinalized === false,
+        "Farmer confirms return inspection; awaiting owner confirmation",
+        JSON.stringify(resFarmerFinalConfirm.data)
+    );
+
+    // Owner confirms return -> Handshake completed (No damage)
+    const resOwnerFinalConfirm = await apiRequest(`/bookings/${s1BookingId}/inspections/final/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    assert(
+        resOwnerFinalConfirm.status === 200 &&
+        resOwnerFinalConfirm.data?.data?.returnFinalized === true &&
+        resOwnerFinalConfirm.data?.data?.damageReported === false,
+        "Owner confirms return inspection; return finalized without damages, booking COMPLETED",
+        JSON.stringify(resOwnerFinalConfirm.data)
+    );
+
+    const [s1BkComplete] = await pool.query("SELECT status, return_completed_at FROM bookings WHERE id = ?", [s1BookingId]);
+    const [s1EqAvailable] = await pool.query("SELECT status FROM equipment WHERE id = ?", [inspEqId]);
+    assert(
+        s1BkComplete[0].status === "COMPLETED" && s1BkComplete[0].return_completed_at !== null && s1EqAvailable[0].status === "AVAILABLE",
+        "Booking is marked COMPLETED and equipment restored to AVAILABLE",
+        `Booking: ${s1BkComplete[0].status}, Eq: ${s1EqAvailable[0].status}`
+    );
+
+    // 6.9 Stage 2: Damaged Return (Rule 7: Never automatically make damaged equipment AVAILABLE)
+    const [inspDamageEq] = await pool.query(
+        `INSERT INTO equipment (owner_id, category_id, location_id, name, equipment_type, description, price_per_day, status, verification_status)
+         VALUES (1, 1, 1, 'Tractor Test Damaged', 'TRACTOR', 'Damage test unit', 1500, 'IN_USE', 'VERIFIED')`
+    );
+    const inspDamageEqId = inspDamageEq.insertId;
+
+    const [damageBk] = await pool.query(
+        `INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status)
+         VALUES (?, 1, DATE_ADD(NOW(), INTERVAL 50 DAY), DATE_ADD(NOW(), INTERVAL 52 DAY), 500, 1000, 200, 'IN_PROGRESS')`,
+        [inspDamageEqId]
+    );
+    const damageBookingId = damageBk.insertId;
+
+    // Farmer submits return inspection
+    await apiRequest(`/bookings/${damageBookingId}/inspections/final`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: {
+            engine_condition: "GOOD",
+            tyres_condition: "POOR",
+            body_condition: "FAIR",
+            fuel_level: "HALF",
+            odometer_hours: 210.0,
+            checklist_notes: "Tyre had a puncture in field.",
+            is_damage_reported: false
+        }
+    });
+
+    // Owner submits return inspection with DAMAGE REPORTED
+    const resOwnerDamageSubmit = await apiRequest(`/bookings/${damageBookingId}/inspections/final`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: {
+            engine_condition: "GOOD",
+            tyres_condition: "DAMAGED",
+            body_condition: "DAMAGED",
+            fuel_level: "HALF",
+            odometer_hours: 210.0,
+            checklist_notes: "Right rear tyre blown and hydraulic lift arm bent.",
+            is_damage_reported: true,
+            damage_description: "Hydraulic lift arm bent, rear tyre damaged.",
+            estimated_damage_cost: 12500
+        }
+    });
+    assert(resOwnerDamageSubmit.status === 200, "Owner records return inspection with damage reported", JSON.stringify(resOwnerDamageSubmit.data));
+
+    // Farmer confirms return
+    await apiRequest(`/bookings/${damageBookingId}/inspections/final/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+
+    // Owner confirms return with damage
+    const resDamageConfirm = await apiRequest(`/bookings/${damageBookingId}/inspections/final/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    assert(
+        resDamageConfirm.status === 200 &&
+        resDamageConfirm.data?.data?.returnFinalized === true &&
+        resDamageConfirm.data?.data?.damageReported === true,
+        "Return finalized with damage flagged",
+        JSON.stringify(resDamageConfirm.data)
+    );
+
+    // Verify Rule 7: Equipment is DAMAGED (NOT AVAILABLE) and booking is DISPUTED
+    const [damagedBkRow] = await pool.query("SELECT status, cancellation_reason FROM bookings WHERE id = ?", [damageBookingId]);
+    const [damagedEqRow] = await pool.query("SELECT status FROM equipment WHERE id = ?", [inspDamageEqId]);
+    const [disputeRows] = await pool.query("SELECT id, dispute_category, status FROM refund_disputes WHERE booking_id = ?", [damageBookingId]);
+    assert(
+        damagedBkRow[0].status === "DISPUTED" &&
+        damagedEqRow[0].status === "DAMAGED" &&
+        disputeRows.length > 0 && disputeRows[0].dispute_category === "EQUIPMENT_DAMAGE_DISPUTE",
+        "RULE 7 ENFORCED: Damaged equipment set to DAMAGED (not AVAILABLE), booking set to DISPUTED, dispute auto-created",
+        `Booking: ${damagedBkRow[0].status}, Eq: ${damagedEqRow[0].status}, Dispute: ${disputeRows[0]?.status}`
+    );
+
+    // 6.10 Inspection History retrieval
+    const resHistory = await apiRequest(`/bookings/${damageBookingId}/inspections`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    assert(
+        resHistory.status === 200 && resHistory.data?.data?.inspections?.length > 0,
+        "Inspection history endpoint returns complete chronological log and stage summaries",
+        `Records: ${resHistory.data?.data?.inspections?.length}`
+    );
 
     // Clean up test server
     server.close();

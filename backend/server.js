@@ -8,6 +8,7 @@ import equipmentCategoryRoutes from "./routes/equipmentCategoryRoutes.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
+import inspectionRoutes from "./routes/inspectionRoutes.js";
 import { 
     checkPaymentVerificationTimeouts, 
     checkBookingAcceptanceTimeouts 
@@ -25,6 +26,7 @@ app.use("/api", equipmentCategoryRoutes);
 app.use("/api", bookingRoutes);
 app.use("/api", paymentRoutes);
 app.use("/api", adminRoutes);
+app.use("/api", inspectionRoutes);
 
 app.get("/", (req, res) => {
   res.json({

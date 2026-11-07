@@ -338,6 +338,51 @@ export const sendSuperAdminEscalationSMS = async ({ superAdminPhone, superAdminN
     });
 };
 
+/**
+ * Inspection Event: Initial or Final Inspection submitted by counterpart
+ */
+export const sendInspectionSubmittedSMS = async ({ recipientPhone, recipientName, bookingId, stage, inspectorRole }) => {
+    const stageName = stage === "INITIAL" ? "Pre-Handover" : "Post-Return";
+    return sendSMS({
+        phone: recipientPhone,
+        eventType: `INSPECTION_${stage}_SUBMITTED`,
+        message: `AgriRent Inspection: The ${inspectorRole.toLowerCase()} has submitted the ${stageName} inspection for Booking #${bookingId}. Please review and submit your confirmation.`
+    });
+};
+
+/**
+ * Inspection Event: Both parties confirmed initial inspection -> Equipment handed over, rental active
+ */
+export const sendHandoverCompletedSMS = async ({ recipientPhone, recipientName, bookingId, equipmentName }) => {
+    return sendSMS({
+        phone: recipientPhone,
+        eventType: "EQUIPMENT_HANDOVER_COMPLETED",
+        message: `AgriRent Handover: Pre-handover inspection for "${equipmentName}" (Booking #${bookingId}) has been confirmed by both parties. Handover is complete and the rental is now ACTIVE.`
+    });
+};
+
+/**
+ * Inspection Event: Return completed without damage
+ */
+export const sendReturnCompletedSMS = async ({ recipientPhone, recipientName, bookingId, equipmentName }) => {
+    return sendSMS({
+        phone: recipientPhone,
+        eventType: "EQUIPMENT_RETURN_COMPLETED",
+        message: `AgriRent Return: Return inspection for "${equipmentName}" (Booking #${bookingId}) has been confirmed by both parties. Equipment returned in good condition. Booking is COMPLETED.`
+    });
+};
+
+/**
+ * Inspection Event: Damage reported during return
+ */
+export const sendReturnDamageDisputeSMS = async ({ recipientPhone, recipientName, bookingId, equipmentName, damageDescription }) => {
+    return sendSMS({
+        phone: recipientPhone,
+        eventType: "EQUIPMENT_RETURN_DAMAGED",
+        message: `AgriRent Damage Alert: Damage reported during return of "${equipmentName}" (Booking #${bookingId}): "${damageDescription || "Damage reported"}". Case is placed under inspection review.`
+    });
+};
+
 export default {
     sendSMS,
     normalizePhoneNumber,
@@ -353,5 +398,9 @@ export default {
     sendRefundReminderSMS,
     sendRefundDisputeSMS,
     sendAreaAdminDisputeSMS,
-    sendSuperAdminEscalationSMS
+    sendSuperAdminEscalationSMS,
+    sendInspectionSubmittedSMS,
+    sendHandoverCompletedSMS,
+    sendReturnCompletedSMS,
+    sendReturnDamageDisputeSMS
 };
