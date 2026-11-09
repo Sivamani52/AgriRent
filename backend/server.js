@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import db from "./db.js";
+import authRoutes from "./routes/authRoutes.js";
 import equipmentMediaRoutes from "./routes/equipmentMediaRoutes.js";
 import equipmentRoutes from "./routes/equipmentRoutes.js";
 import equipmentCategoryRoutes from "./routes/equipmentCategoryRoutes.js";
@@ -23,6 +24,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+app.use("/api", authRoutes);
 app.use("/api", equipmentMediaRoutes);
 app.use("/api", equipmentRoutes);
 app.use("/api", equipmentCategoryRoutes);

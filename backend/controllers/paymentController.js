@@ -13,10 +13,12 @@ import {
  * Access: Authenticated FARMER associated with the booking.
  */
 export const submitPayment = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
         const { booking_id, transaction_id, payment_method } = req.body;
 
         if (!booking_id || !transaction_id || !payment_method) {
+            connection.release();
             return res.status(400).json({
                 success: false,
                 message: "booking_id, transaction_id and payment_method are required"
@@ -24,13 +26,16 @@ export const submitPayment = async (req, res) => {
         }
 
         if (!["UPI", "BANK_TRANSFER"].includes(payment_method)) {
+            connection.release();
             return res.status(400).json({
                 success: false,
                 message: "Invalid payment method"
             });
         }
 
-        const [bookings] = await pool.query(
+        await connection.beginTransaction();
+
+        const [bookings] = await connection.query(
             `SELECT 
                 b.id,
                 b.farmer_id,
@@ -47,11 +52,13 @@ export const submitPayment = async (req, res) => {
             JOIN equipment e ON b.equipment_id = e.id
             JOIN owners o ON e.owner_id = o.id
             JOIN users ou ON o.user_id = ou.id
-            WHERE b.id = ?`,
+            WHERE b.id = ?
+            FOR UPDATE`,
             [booking_id]
         );
 
         if (bookings.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 success: false,
                 message: "Booking not found"
@@ -62,6 +69,7 @@ export const submitPayment = async (req, res) => {
 
         // IDOR Prevention: Only the farmer associated with this booking can pay
         if (booking.farmer_user_id !== req.user.id) {
+            await connection.rollback();
             return res.status(403).json({
                 success: false,
                 message: "You are not authorized to submit payment for this booking"
@@ -69,13 +77,14 @@ export const submitPayment = async (req, res) => {
         }
 
         if (!booking.payment_window_open) {
-            await pool.query(
+            await connection.query(
                 `UPDATE bookings
                  SET status = 'CANCELLED',
                      cancellation_reason = 'Payment deadline expired'
                  WHERE id = ?`,
                 [booking_id]
             );
+            await connection.commit();
 
             return res.status(400).json({
                 success: false,
@@ -84,28 +93,44 @@ export const submitPayment = async (req, res) => {
         }
 
         if (booking.status !== "ACCEPTED") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Payment can only be submitted for an accepted booking"
             });
         }
 
-        const [existingPayment] = await pool.query(
+        const [existingPayment] = await connection.query(
             `SELECT id
              FROM booking_payments
              WHERE booking_id = ?
-             AND status IN ('PAYMENT_PENDING', 'PAYMENT_VERIFIED')`,
+             AND status IN ('PAYMENT_PENDING', 'PAYMENT_VERIFIED')
+             FOR UPDATE`,
             [booking_id]
         );
 
         if (existingPayment.length > 0) {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Payment has already been submitted for this booking"
             });
         }
 
-        const [result] = await pool.query(
+        const [existingTxn] = await connection.query(
+            `SELECT id FROM booking_payments WHERE transaction_id = ?`,
+            [transaction_id.trim()]
+        );
+
+        if (existingTxn.length > 0) {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "This transaction ID has already been recorded"
+            });
+        }
+
+        const [result] = await connection.query(
             `INSERT INTO booking_payments (
                 booking_id,
                 amount,
@@ -122,6 +147,8 @@ export const submitPayment = async (req, res) => {
                 payment_method
             ]
         );
+
+        await connection.commit();
 
         // Send SMS notification to owner (Event 6)
         sendPaymentSubmittedSMS({
@@ -146,12 +173,15 @@ export const submitPayment = async (req, res) => {
         });
 
     } catch (error) {
+        await connection.rollback();
         console.error("Submit payment error:", error.message || error);
 
         return res.status(500).json({
             success: false,
             message: "Failed to submit payment"
         });
+    } finally {
+        connection.release();
     }
 };
 
@@ -752,6 +782,28 @@ export const confirmRefund = async (req, res) => {
              WHERE id = ?`,
             [paymentId]
         );
+
+        // Synchronize and close any associated dispute in refund_disputes
+        const [linkedDisputes] = await connection.query(
+            `SELECT id, status, resolution_outcome 
+             FROM refund_disputes 
+             WHERE payment_id = ? OR booking_id = ?`,
+            [paymentId, payment.booking_id]
+        );
+
+        for (const ld of linkedDisputes) {
+            if (ld.status !== "CLOSED") {
+                await connection.query(
+                    `UPDATE refund_disputes
+                     SET status = 'CLOSED',
+                         resolution_outcome = COALESCE(resolution_outcome, 'REFUND_CONFIRMED'),
+                         resolved_at = COALESCE(resolved_at, NOW()),
+                         admin_notes = CONCAT(COALESCE(admin_notes, ''), '\n[', NOW(), ' Farmer Refund Confirmed]: Farmer confirmed receipt of refund. Case formally closed.')
+                     WHERE id = ?`,
+                    [ld.id]
+                );
+            }
+        }
 
         const [updatedRows] = await connection.query(
             `SELECT

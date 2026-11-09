@@ -91,170 +91,194 @@ export const createBooking = async (req, res) => {
             });
         }
 
-        const [equipment] = await pool.query(
-            `SELECT
-                e.id,
-                e.name,
-                e.price_per_day,
-                e.status,
-                e.verification_status,
-                e.location_id,
-                e.owner_id,
-                ou.phone AS owner_phone,
-                ou.full_name AS owner_name
-             FROM equipment e
-             JOIN owners o ON e.owner_id = o.id
-             JOIN users ou ON o.user_id = ou.id
-             WHERE e.id = ?`,
-            [equipment_id]
-        );
+        const connection = await pool.getConnection();
+        try {
+            await connection.beginTransaction();
 
-        if (equipment.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: "Equipment not found"
-            });
-        }
+            const [equipment] = await connection.query(
+                `SELECT
+                    e.id,
+                    e.name,
+                    e.price_per_day,
+                    e.status,
+                    e.verification_status,
+                    e.location_id,
+                    e.owner_id,
+                    ou.phone AS owner_phone,
+                    ou.full_name AS owner_name
+                 FROM equipment e
+                 JOIN owners o ON e.owner_id = o.id
+                 JOIN users ou ON o.user_id = ou.id
+                 WHERE e.id = ?
+                 FOR UPDATE`,
+                [equipment_id]
+            );
 
-        const selectedEquipment = equipment[0];
-
-        // Restrict Area Admin from booking equipment outside their assigned area
-        if (req.user.role === "AREA_ADMIN" && req.user.location_id) {
-            if (selectedEquipment.location_id && selectedEquipment.location_id !== req.user.location_id) {
-                return res.status(403).json({
+            if (equipment.length === 0) {
+                await connection.rollback();
+                return res.status(404).json({
                     success: false,
-                    message: "Area Admin cannot book equipment outside their assigned area"
+                    message: "Equipment not found"
                 });
             }
-        }
 
-        if (selectedEquipment.verification_status !== "VERIFIED") {
-            return res.status(400).json({
-                success: false,
-                message: "Equipment is not verified"
-            });
-        }
+            const selectedEquipment = equipment[0];
 
-        if (selectedEquipment.status !== "AVAILABLE") {
-            return res.status(400).json({
-                success: false,
-                message: "Equipment is not currently available"
-            });
-        }
-
-        const startDate = new Date(start_date);
-        const endDate = new Date(end_date);
-
-        if (
-            Number.isNaN(startDate.getTime()) ||
-            Number.isNaN(endDate.getTime())
-        ) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid start_date or end_date"
-            });
-        }
-
-        if (endDate <= startDate) {
-            return res.status(400).json({
-                success: false,
-                message: "End date must be after start date"
-            });
-        }
-
-        const [overlappingBookings] = await pool.query(
-            `SELECT id
-             FROM bookings
-             WHERE equipment_id = ?
-             AND status IN (
-                'PENDING',
-                'ACCEPTED',
-                'CONFIRMED',
-                'IN_PROGRESS'
-             )
-             AND start_date < ?
-             AND end_date > ?`,
-            [
-                equipment_id,
-                end_date,
-                start_date
-            ]
-        );
-
-        if (overlappingBookings.length > 0) {
-            return res.status(409).json({
-                success: false,
-                message: "Equipment is already booked for the selected dates"
-            });
-        }
-
-        const millisecondsPerDay = 1000 * 60 * 60 * 24;
-
-        const rentalDays = Math.ceil(
-            (endDate - startDate) / millisecondsPerDay
-        );
-
-        const pricePerDay = Number(
-            selectedEquipment.price_per_day
-        );
-
-        if (!pricePerDay || pricePerDay <= 0) {
-            return res.status(400).json({
-                success: false,
-                message: "Equipment does not have a valid daily rental price"
-            });
-        }
-
-        const totalAmount = rentalDays * pricePerDay;
-
-        const advanceAmount = totalAmount * 0.20;
-
-        const [result] = await pool.query(
-            `INSERT INTO bookings (
-                equipment_id,
-                farmer_id,
-                start_date,
-                end_date,
-                price_per_day,
-                total_amount,
-                advance_amount,
-                status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
-            [
-                equipment_id,
-                effectiveFarmerId,
-                start_date,
-                end_date,
-                pricePerDay,
-                totalAmount,
-                advanceAmount
-            ]
-        );
-
-        sendBookingRequestSMS({
-            ownerPhone: selectedEquipment.owner_phone,
-            ownerName: selectedEquipment.owner_name,
-            equipmentName: selectedEquipment.name,
-            bookingId: result.insertId
-        }).catch(err => console.error("Booking request SMS error:", err));
-
-        return res.status(201).json({
-            success: true,
-            message: "Booking request created successfully",
-            data: {
-                bookingId: result.insertId,
-                equipmentId: Number(equipment_id),
-                farmerId: Number(effectiveFarmerId),
-                startDate: start_date,
-                endDate: end_date,
-                rentalDays,
-                pricePerDay,
-                totalAmount,
-                advanceAmount,
-                status: "PENDING"
+            // Restrict Area Admin from booking equipment outside their assigned area
+            if (req.user.role === "AREA_ADMIN" && req.user.location_id) {
+                if (selectedEquipment.location_id && selectedEquipment.location_id !== req.user.location_id) {
+                    await connection.rollback();
+                    return res.status(403).json({
+                        success: false,
+                        message: "Area Admin cannot book equipment outside their assigned area"
+                    });
+                }
             }
-        });
+
+            if (selectedEquipment.verification_status !== "VERIFIED") {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    message: "Equipment is not verified"
+                });
+            }
+
+            if (selectedEquipment.status !== "AVAILABLE") {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    message: "Equipment is not currently available"
+                });
+            }
+
+            const startDate = new Date(start_date);
+            const endDate = new Date(end_date);
+
+            if (
+                Number.isNaN(startDate.getTime()) ||
+                Number.isNaN(endDate.getTime())
+            ) {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid start_date or end_date"
+                });
+            }
+
+            if (endDate <= startDate) {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    message: "End date must be after start date"
+                });
+            }
+
+            // Lock and check overlapping bookings inside the transaction
+            const [overlappingBookings] = await connection.query(
+                `SELECT id
+                 FROM bookings
+                 WHERE equipment_id = ?
+                 AND status IN (
+                    'PENDING',
+                    'ACCEPTED',
+                    'CONFIRMED',
+                    'IN_PROGRESS'
+                 )
+                 AND start_date < ?
+                 AND end_date > ?
+                 FOR UPDATE`,
+                [
+                    equipment_id,
+                    end_date,
+                    start_date
+                ]
+            );
+
+            if (overlappingBookings.length > 0) {
+                await connection.rollback();
+                return res.status(409).json({
+                    success: false,
+                    message: "Equipment is already booked for the selected dates"
+                });
+            }
+
+            const millisecondsPerDay = 1000 * 60 * 60 * 24;
+
+            const rentalDays = Math.ceil(
+                (endDate - startDate) / millisecondsPerDay
+            );
+
+            const pricePerDay = Number(
+                selectedEquipment.price_per_day
+            );
+
+            if (!pricePerDay || pricePerDay <= 0) {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    message: "Equipment does not have a valid daily rental price"
+                });
+            }
+
+            const totalAmount = rentalDays * pricePerDay;
+
+            const advanceAmount = totalAmount * 0.20;
+
+            const [result] = await connection.query(
+                `INSERT INTO bookings (
+                    equipment_id,
+                    farmer_id,
+                    start_date,
+                    end_date,
+                    price_per_day,
+                    total_amount,
+                    advance_amount,
+                    status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+                [
+                    equipment_id,
+                    effectiveFarmerId,
+                    start_date,
+                    end_date,
+                    pricePerDay,
+                    totalAmount,
+                    advanceAmount
+                ]
+            );
+
+            await connection.commit();
+
+            sendBookingRequestSMS({
+                ownerPhone: selectedEquipment.owner_phone,
+                ownerName: selectedEquipment.owner_name,
+                equipmentName: selectedEquipment.name,
+                bookingId: result.insertId
+            }).catch(err => console.error("Booking request SMS error:", err));
+
+            return res.status(201).json({
+                success: true,
+                message: "Booking request created successfully",
+                data: {
+                    bookingId: result.insertId,
+                    equipmentId: Number(equipment_id),
+                    farmerId: Number(effectiveFarmerId),
+                    startDate: start_date,
+                    endDate: end_date,
+                    rentalDays,
+                    pricePerDay,
+                    totalAmount,
+                    advanceAmount,
+                    status: "PENDING"
+                }
+            });
+
+        } catch (trxErr) {
+            await connection.rollback();
+            throw trxErr;
+        } finally {
+            connection.release();
+        }
 
     } catch (error) {
         console.error(

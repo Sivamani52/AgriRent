@@ -52,7 +52,7 @@ export const authenticateUser = async (req, res, next) => {
             });
         }
         const [users] = await pool.query(
-            "SELECT id, full_name, email, role, status FROM users WHERE id = ?",
+            "SELECT id, full_name, phone, email, role, status, suspended_until, suspension_reason FROM users WHERE id = ?",
             [userId]
         );
 
@@ -64,6 +64,31 @@ export const authenticateUser = async (req, res, next) => {
         }
 
         const user = users[0];
+
+        // Check if temporary suspension has expired
+        if (user.status === "SUSPENDED") {
+            if (user.suspended_until && new Date() > new Date(user.suspended_until)) {
+                // Auto-reactivate expired suspension
+                await pool.query(
+                    "UPDATE users SET status = 'ACTIVE', suspended_until = NULL, suspension_reason = NULL WHERE id = ?",
+                    [user.id]
+                );
+                user.status = "ACTIVE";
+            } else {
+                const untilStr = user.suspended_until ? new Date(user.suspended_until).toISOString() : "further notice";
+                return res.status(403).json({
+                    success: false,
+                    message: `Account is temporarily suspended until ${untilStr}. Reason: ${user.suspension_reason || "Administrative suspension"}`
+                });
+            }
+        }
+
+        if (user.status === "BLOCKED") {
+            return res.status(403).json({
+                success: false,
+                message: `Account has been permanently blocked. Reason: ${user.suspension_reason || "Policy violation"}`
+            });
+        }
 
         if (user.status !== "ACTIVE") {
             return res.status(403).json({

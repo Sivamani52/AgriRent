@@ -8,6 +8,7 @@ import paymentRoutes from "./routes/paymentRoutes.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
 import inspectionRoutes from "./routes/inspectionRoutes.js";
+import authRoutes from "./routes/authRoutes.js";
 import {
     checkBookingAcceptanceTimeouts,
     checkPaymentVerificationTimeouts
@@ -27,6 +28,7 @@ app.use("/api", paymentRoutes);
 app.use("/api", bookingRoutes);
 app.use("/api", adminRoutes);
 app.use("/api", inspectionRoutes);
+app.use("/api", authRoutes);
 
 const server = app.listen(0);
 const port = server.address().port;
@@ -207,7 +209,7 @@ async function runTests() {
         headers: { Authorization: `Bearer ${farmerToken}` },
         body: {
             booking_id: testBookingId,
-            transaction_id: "TXN_TEST_12345",
+            transaction_id: `TXN_TEST_${Date.now()}`,
             payment_method: "UPI"
         }
     });
@@ -1060,6 +1062,678 @@ async function runTests() {
 
     // Restore original Cloudinary destroy
     cloudinary.uploader.destroy = originalCloudinaryDestroy;
+
+    // -------------------------------------------------------------------------
+    // 8. SUPER ADMIN FINAL DISPUTE RESOLUTION & ACCOUNT ADMINISTRATION TESTS
+    // -------------------------------------------------------------------------
+    console.log("\n--- 8. SUPER ADMIN FINAL DISPUTE RESOLUTION & ACCOUNT ADMINISTRATION TESTS ---");
+
+    // 8.1 Super Admin Platform-Wide Disputes Dashboard & RBAC
+    const resSuperDashboard = await apiRequest("/admin/super/disputes", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    assert(
+        resSuperDashboard.status === 200 && Array.isArray(resSuperDashboard.data?.data),
+        "Super Admin successfully retrieves platform-wide dispute dashboard",
+        `Count: ${resSuperDashboard.data?.count}`
+    );
+
+    // RBAC: Area Admin, Farmer, and Owner cannot access Super Admin dashboard
+    const resAreaAdminForbiddenDash = await apiRequest("/admin/super/disputes", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${areaAdminToken}` }
+    });
+    assert(resAreaAdminForbiddenDash.status === 403, "RBAC: Area Admin forbidden from Super Admin dashboard (403)", JSON.stringify(resAreaAdminForbiddenDash.data));
+
+    const resFarmerForbiddenDash = await apiRequest("/admin/super/disputes", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    assert(resFarmerForbiddenDash.status === 403, "RBAC: Farmer forbidden from Super Admin dashboard (403)", JSON.stringify(resFarmerForbiddenDash.data));
+
+    // Create an escalated dispute with booking, payment, and evidence for review
+    const [bSuper] = await pool.query(
+        `INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status)
+         VALUES (?, 1, DATE_ADD(NOW(), INTERVAL 60 DAY), DATE_ADD(NOW(), INTERVAL 62 DAY), 500, 1000, 200, 'DISPUTED')`,
+        [inspEqId]
+    );
+    const bSuperId = bSuper.insertId;
+
+    const [pSuper] = await pool.query(
+        `INSERT INTO booking_payments (booking_id, amount, transaction_id, payment_method, status, refund_status)
+         VALUES (?, 200, 'TXN_SUPER_TEST', 'UPI', 'PAYMENT_VERIFIED', 'REFUND_DISPUTED')`,
+        [bSuperId]
+    );
+    const pSuperId = pSuper.insertId;
+
+    const [dSuper] = await pool.query(
+        `INSERT INTO refund_disputes (booking_id, payment_id, dispute_reason, dispute_category, raised_by_user_id, raised_by_role, status, assigned_area_admin_id, escalation_reason, escalated_at)
+         VALUES (?, ?, 'Tractor hydraulic pump failed and owner refused refund', 'REFUND_NOT_RECEIVED', 2, 'FARMER', 'ESCALATED_TO_SUPER_ADMIN', 1, 'Exceeded 48h deadline', NOW())`,
+        [bSuperId, pSuperId]
+    );
+    const dSuperId = dSuper.insertId;
+
+    await pool.query(
+        `INSERT INTO dispute_evidence (dispute_id, uploaded_by_user_id, evidence_type, title, description, file_url, public_id)
+         VALUES (?, 1, 'DOCUMENT', 'Mechanic Estimate', 'Hydraulic repair estimate Rs 4000', 'https://res.cloudinary.com/demo/image/upload/v1/invoice.pdf', 'disputes/inv1')`,
+        [dSuperId]
+    );
+
+    // 8.2 Investigation Review (Full Composite Dossier)
+    const resDossier = await apiRequest(`/admin/super/disputes/${dSuperId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    assert(
+        resDossier.status === 200 &&
+        resDossier.data?.data?.disputeId === dSuperId &&
+        resDossier.data?.data?.evidenceFiles?.length > 0 &&
+        resDossier.data?.data?.farmer?.userId === 2 &&
+        resDossier.data?.data?.owner?.userId === 1,
+        "Super Admin retrieves complete composite investigation dossier",
+        JSON.stringify(resDossier.data?.data?.disputeCategory)
+    );
+
+    const resAreaAdminForbiddenDossier = await apiRequest(`/admin/super/disputes/${dSuperId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${areaAdminToken}` }
+    });
+    assert(resAreaAdminForbiddenDossier.status === 403, "RBAC: Area Admin forbidden from Super Admin dossier (403)", JSON.stringify(resAreaAdminForbiddenDossier.data));
+
+    // 8.3 Feature 3: Additional Evidence Request (Remand to Area Admin)
+    const resRemand = await apiRequest(`/admin/super/disputes/${dSuperId}/request-evidence`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { instructions: "Area Admin please interview the mechanic and verify invoice authenticity" }
+    });
+    assert(
+        resRemand.status === 200 && resRemand.data?.data?.status === "EVIDENCE_REQUESTED",
+        "Super Admin remands dispute to Area Admin for additional evidence (status -> EVIDENCE_REQUESTED)",
+        JSON.stringify(resRemand.data)
+    );
+
+    const [chkRemandDispute] = await pool.query(
+        "SELECT status, evidence_request_instructions FROM refund_disputes WHERE id = ?",
+        [dSuperId]
+    );
+    const [chkRemandAudit] = await pool.query(
+        "SELECT action_type FROM dispute_audit_logs WHERE dispute_id = ? AND action_type = 'EVIDENCE_REQUESTED_BY_SUPER_ADMIN'",
+        [dSuperId]
+    );
+    assert(
+        chkRemandDispute[0].status === "EVIDENCE_REQUESTED" && chkRemandAudit.length > 0,
+        "Database updated to EVIDENCE_REQUESTED with remand instructions and audit log recorded",
+        `Status: ${chkRemandDispute[0].status}`
+    );
+
+    // 8.4 Feature 4 & 9: Final Dispute Decision — REFUND_REQUIRED
+    // Reset dispute status to ESCALATED_TO_SUPER_ADMIN for adjudication
+    await pool.query("UPDATE refund_disputes SET status = 'ESCALATED_TO_SUPER_ADMIN' WHERE id = ?", [dSuperId]);
+
+    // Area Admin attempting final decision must be blocked
+    const resAreaAdminForbiddenDecide = await apiRequest(`/admin/super/disputes/${dSuperId}/decide`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: { decision: "REFUND_REQUIRED", reason: "Attempted by Area Admin" }
+    });
+    assert(resAreaAdminForbiddenDecide.status === 403, "RBAC: Area Admin cannot issue final dispute decisions (403)", JSON.stringify(resAreaAdminForbiddenDecide.data));
+
+    // Super Admin issues final decision: REFUND_REQUIRED
+    const resSuperDecideRefund = await apiRequest(`/admin/super/disputes/${dSuperId}/decide`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: {
+            decision: "REFUND_REQUIRED",
+            reason: "Evidence proves equipment malfunction. Full advance refund ordered.",
+            remarks: "Owner must submit refund transaction within 24 hours."
+        }
+    });
+    assert(
+        resSuperDecideRefund.status === 200 && resSuperDecideRefund.data?.data?.decision === "REFUND_REQUIRED",
+        "Super Admin successfully issues final ruling: REFUND_REQUIRED",
+        JSON.stringify(resSuperDecideRefund.data)
+    );
+
+    const [chkResolvedDispute] = await pool.query(
+        "SELECT status, resolution_outcome, resolved_by_user_id FROM refund_disputes WHERE id = ?",
+        [dSuperId]
+    );
+    const [chkResolvedPayment] = await pool.query(
+        "SELECT refund_status, refund_deadline FROM booking_payments WHERE id = ?",
+        [pSuperId]
+    );
+    assert(
+        chkResolvedDispute[0].status === "RESOLVED" &&
+        chkResolvedDispute[0].resolution_outcome === "REFUND_REQUIRED" &&
+        chkResolvedPayment[0].refund_status === "REFUND_REQUIRED" &&
+        chkResolvedPayment[0].refund_deadline !== null,
+        "Dispute marked RESOLVED, resolution_outcome set to REFUND_REQUIRED, booking_payment refund_status set to REFUND_REQUIRED with 24h deadline",
+        `Outcome: ${chkResolvedDispute[0].resolution_outcome}, RefundStatus: ${chkResolvedPayment[0].refund_status}`
+    );
+
+    // 8.5 Feature 7: Duplicate Final Decision Prevention
+    const resDupDecide = await apiRequest(`/admin/super/disputes/${dSuperId}/decide`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { decision: "REFUND_REQUIRED", reason: "Duplicate decision attempt" }
+    });
+    assert(
+        resDupDecide.status === 400,
+        "Duplicate final decision rejected with 400 (case already resolved)",
+        JSON.stringify(resDupDecide.data)
+    );
+
+    // 8.6 Final Dispute Decision — DISPUTE_REJECTED
+    const [dReject] = await pool.query(
+        `INSERT INTO refund_disputes (booking_id, dispute_reason, dispute_category, raised_by_user_id, raised_by_role, status)
+         VALUES (?, 'Frivolous complaint', 'REFUND_NOT_RECEIVED', 2, 'FARMER', 'ESCALATED_TO_SUPER_ADMIN')`,
+        [bSuperId]
+    );
+    const dRejectId = dReject.insertId;
+
+    const resDecideReject = await apiRequest(`/admin/super/disputes/${dRejectId}/decide`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { decision: "DISPUTE_REJECTED", reason: "Damage caused by external field conditions, not equipment defect." }
+    });
+    assert(
+        resDecideReject.status === 200 && resDecideReject.data?.data?.decision === "DISPUTE_REJECTED",
+        "Super Admin successfully issues final ruling: DISPUTE_REJECTED",
+        JSON.stringify(resDecideReject.data)
+    );
+
+    const [chkRejectedDispute] = await pool.query(
+        "SELECT status, resolution_outcome FROM refund_disputes WHERE id = ?",
+        [dRejectId]
+    );
+    assert(
+        chkRejectedDispute[0].status === "RESOLVED" && chkRejectedDispute[0].resolution_outcome === "DISPUTE_REJECTED",
+        "Dispute marked RESOLVED with outcome DISPUTE_REJECTED",
+        `Outcome: ${chkRejectedDispute[0].resolution_outcome}`
+    );
+
+    // 8.7 Feature 5: Account Administration — Warnings
+    const [existingTarget] = await pool.query("SELECT id FROM users WHERE phone = '9888877771'");
+    let targetUserId;
+    if (existingTarget.length === 0) {
+        const [targetU] = await pool.query(
+            `INSERT INTO users (full_name, phone, password_hash, role, status)
+             VALUES ('Disciplinary Target', '9888877771', 'dummyhash', 'FARMER', 'ACTIVE')`
+        );
+        targetUserId = targetU.insertId;
+    } else {
+        targetUserId = existingTarget[0].id;
+        await pool.query("UPDATE users SET status = 'ACTIVE', warning_count = 0, suspended_until = NULL, suspension_reason = NULL WHERE id = ?", [targetUserId]);
+    }
+    const targetUserToken = jwt.sign({ id: targetUserId }, JWT_SECRET, { expiresIn: "1h" });
+
+    // Area Admin forbidden from issuing account actions
+    const resAreaAdminForbiddenAction = await apiRequest(`/admin/super/users/${targetUserId}/account-action`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: { actionType: "WARN", reason: "Area Admin attempt" }
+    });
+    assert(resAreaAdminForbiddenAction.status === 403, "RBAC: Area Admin forbidden from user account actions (403)", JSON.stringify(resAreaAdminForbiddenAction.data));
+
+    // Super Admin issues warning
+    const resWarn = await apiRequest(`/admin/super/users/${targetUserId}/account-action`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { actionType: "WARN", reason: "First violation: Delayed equipment return without notice", disputeId: dSuperId }
+    });
+    assert(resWarn.status === 200, "Super Admin issues warning successfully", JSON.stringify(resWarn.data));
+
+    const [chkWarnUser] = await pool.query("SELECT warning_count FROM users WHERE id = ?", [targetUserId]);
+    assert(chkWarnUser[0].warning_count === 1, "User warning_count incremented to 1", `Count: ${chkWarnUser[0].warning_count}`);
+
+    // 8.8 Feature 5: Account Administration — Temporary Suspension & Session Lockout
+    const resSuspend = await apiRequest(`/admin/super/users/${targetUserId}/account-action`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { actionType: "SUSPEND", reason: "Repeated contract violation", durationDays: 7, disputeId: dSuperId }
+    });
+    assert(resSuspend.status === 200 && resSuspend.data?.data?.newStatus === "SUSPENDED", "Super Admin temporarily suspends user for 7 days", JSON.stringify(resSuspend.data));
+
+    // Session Lockout Verification: Suspended user is rejected on authenticated routes
+    const resSuspendedCall = await apiRequest("/equipment", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${targetUserToken}` },
+        body: { name: "Unauthorized Attempt" }
+    });
+    assert(
+        resSuspendedCall.status === 403 && resSuspendedCall.data?.message?.includes("temporarily suspended"),
+        "SESSION LOCKOUT: Suspended user is immediately rejected by authMiddleware with 403",
+        JSON.stringify(resSuspendedCall.data)
+    );
+
+    // 8.9 Feature 5: Account Administration — Permanent Block
+    const resBlock = await apiRequest(`/admin/super/users/${targetUserId}/account-action`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { actionType: "BLOCK", reason: "Severe fraud and non-payment", disputeId: dSuperId }
+    });
+    assert(resBlock.status === 200 && resBlock.data?.data?.newStatus === "BLOCKED", "Super Admin permanently blocks user account", JSON.stringify(resBlock.data));
+
+    const resBlockedCall = await apiRequest("/equipment", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${targetUserToken}` },
+        body: { name: "Blocked Attempt" }
+    });
+    assert(
+        resBlockedCall.status === 403 && resBlockedCall.data?.message?.includes("permanently blocked"),
+        "SESSION LOCKOUT: Blocked user is permanently rejected by authMiddleware with 403",
+        JSON.stringify(resBlockedCall.data)
+    );
+
+    // 8.10 Feature 5: Account Administration — Reactivation
+    const resReactivate = await apiRequest(`/admin/super/users/${targetUserId}/account-action`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { actionType: "REACTIVATE", reason: "Appeal approved and fine settled", disputeId: dSuperId }
+    });
+    assert(resReactivate.status === 200 && resReactivate.data?.data?.newStatus === "ACTIVE", "Super Admin reactivates account back to ACTIVE", JSON.stringify(resReactivate.data));
+
+    const [chkReactivatedUser] = await pool.query("SELECT status, suspended_until, suspension_reason FROM users WHERE id = ?", [targetUserId]);
+    assert(
+        chkReactivatedUser[0].status === "ACTIVE" && chkReactivatedUser[0].suspended_until === null && chkReactivatedUser[0].suspension_reason === null,
+        "User restored to ACTIVE, suspended_until and suspension_reason cleared",
+        `Status: ${chkReactivatedUser[0].status}`
+    );
+
+    // 8.11 User Disciplinary and Dispute History
+    const resAuditHistory = await apiRequest(`/admin/super/users/${targetUserId}/audit-history`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    assert(
+        resAuditHistory.status === 200 && resAuditHistory.data?.data?.auditHistory?.length >= 4,
+        "Super Admin retrieves complete user disciplinary audit history (WARN, SUSPEND, BLOCK, REACTIVATE)",
+        `Audit entries: ${resAuditHistory.data?.data?.auditHistory?.length}`
+    );
+
+    // -------------------------------------------------------------------------
+    // 9. AREA ADMIN INVESTIGATION, EVIDENCE UPLOAD & LIFECYCLE CLOSURE TESTS
+    // -------------------------------------------------------------------------
+    console.log("\n--- 9. AREA ADMIN INVESTIGATION, EVIDENCE UPLOAD & LIFECYCLE CLOSURE TESTS ---");
+
+    // 9.1 Create a fresh dispute in Area Admin's location for investigation
+    const [bAreaTest] = await pool.query(
+        `INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status)
+         VALUES (?, 1, DATE_ADD(NOW(), INTERVAL 10 DAY), DATE_ADD(NOW(), INTERVAL 12 DAY), 500, 1000, 200, 'DISPUTED')`,
+        [inspEqId]
+    );
+    const bAreaTestId = bAreaTest.insertId;
+
+    const [aaRows] = await pool.query("SELECT id FROM area_admins WHERE user_id = 4");
+    const testAreaAdminId = aaRows.length > 0 ? aaRows[0].id : 1;
+
+    const [dAreaTest] = await pool.query(
+        `INSERT INTO refund_disputes (booking_id, dispute_reason, dispute_category, raised_by_user_id, raised_by_role, status, assigned_area_admin_id)
+         VALUES (?, 'Equipment broke down on day one', 'EQUIPMENT_DAMAGE_DISPUTE', 1, 'FARMER', 'OPEN', ?)`,
+        [bAreaTestId, testAreaAdminId]
+    );
+    const dAreaTestId = dAreaTest.insertId;
+
+    // 9.2 Area Admin records investigation findings and recommendations
+    const resUpdateInvestigation = await apiRequest(`/admin/disputes/${dAreaTestId}/investigation`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: {
+            investigationFindings: "Inspected equipment at farm: fuel injector was faulty prior to handover.",
+            recommendedAction: "Issue 100% refund of advance payment to farmer.",
+            adminNotes: "Contacted both parties via phone on site."
+        }
+    });
+    assert(
+        resUpdateInvestigation.status === 200 && resUpdateInvestigation.data?.data?.status === "UNDER_ADMIN_REVIEW",
+        "Area Admin successfully records investigation findings, transitioning dispute to UNDER_ADMIN_REVIEW",
+        JSON.stringify(resUpdateInvestigation.data)
+    );
+
+    // 9.3 RBAC: Farmer forbidden from updating investigation findings
+    const resFarmerForbiddenInvestigate = await apiRequest(`/admin/disputes/${dAreaTestId}/investigation`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: { investigationFindings: "Unauthorized attempt" }
+    });
+    assert(
+        resFarmerForbiddenInvestigate.status === 403,
+        "RBAC: Farmer forbidden from updating dispute investigation (403)",
+        JSON.stringify(resFarmerForbiddenInvestigate.data)
+    );
+
+    // 9.4 Area Admin manual escalation to Super Admin
+    const resManualEscalate = await apiRequest(`/admin/disputes/${dAreaTestId}/escalate`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: { reason: "Owner refuses to cooperate with Area Admin recommendation." }
+    });
+    assert(
+        resManualEscalate.status === 200 && resManualEscalate.data?.data?.status === "ESCALATED_TO_SUPER_ADMIN",
+        "Area Admin successfully escalates active dispute to Super Admin with justification",
+        JSON.stringify(resManualEscalate.data)
+    );
+
+    const [chkEscalatedAudit] = await pool.query(
+        "SELECT action_type, performed_by_role FROM dispute_audit_logs WHERE dispute_id = ? AND action_type = 'DISPUTE_ESCALATED'",
+        [dAreaTestId]
+    );
+    assert(
+        chkEscalatedAudit.length > 0 && chkEscalatedAudit[0].performed_by_role === "AREA_ADMIN",
+        "Manual dispute escalation immutable audit log successfully recorded",
+        JSON.stringify(chkEscalatedAudit)
+    );
+
+    // 9.5 Duplicate escalation rejected
+    const resDupEscalate = await apiRequest(`/admin/disputes/${dAreaTestId}/escalate`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: { reason: "Second attempt" }
+    });
+    assert(
+        resDupEscalate.status === 400,
+        "Duplicate dispute escalation safely rejected with 400",
+        JSON.stringify(resDupEscalate.data)
+    );
+
+    // 9.6 Dispute Lifecycle Closure on Farmer Refund Confirmation
+    // Create a payment under dispute with REFUND_SUBMITTED
+    const [pSyncTest] = await pool.query(
+        `INSERT INTO booking_payments (booking_id, transaction_id, payment_method, amount, status, refund_status, refund_transaction_id, refund_submitted_at, farmer_refund_response_deadline)
+         VALUES (?, 'TXN_SYNC_ORIG', 'UPI', 200, 'PAYMENT_REJECTED', 'REFUND_SUBMITTED', 'TXN_SYNC_TEST', NOW(), DATE_ADD(NOW(), INTERVAL 24 HOUR))`,
+        [bAreaTestId]
+    );
+    const pSyncTestId = pSyncTest.insertId;
+
+    await pool.query(
+        "UPDATE refund_disputes SET payment_id = ?, status = 'RESOLVED', resolution_outcome = 'REFUND_REQUIRED' WHERE id = ?",
+        [pSyncTestId, dAreaTestId]
+    );
+
+    // Farmer confirms receipt of the refund
+    const resFarmerConfirmRefund = await apiRequest(`/payments/${pSyncTestId}/refund/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    assert(
+        resFarmerConfirmRefund.status === 200 && resFarmerConfirmRefund.data?.data?.refundStatus === "REFUNDED",
+        "Farmer confirms refund receipt successfully",
+        JSON.stringify(resFarmerConfirmRefund.data)
+    );
+
+    // Verify linked dispute in refund_disputes moved to CLOSED
+    const [chkClosedDispute] = await pool.query(
+        "SELECT status, resolution_outcome FROM refund_disputes WHERE id = ?",
+        [dAreaTestId]
+    );
+    assert(
+        chkClosedDispute[0].status === "CLOSED" && chkClosedDispute[0].resolution_outcome === "REFUND_REQUIRED",
+        "LIFECYCLE CLOSURE: Linked refund dispute automatically updated to CLOSED upon farmer refund confirmation",
+        `Status: ${chkClosedDispute[0].status}, Outcome: ${chkClosedDispute[0].resolution_outcome}`
+    );
+
+    // -------------------------------------------------------------------------
+    // 10. AUTHENTICATION, OTP LIFECYCLE & CONCURRENCY CONTROL TESTS
+    // -------------------------------------------------------------------------
+    console.log("\n--- 10. AUTHENTICATION, OTP LIFECYCLE & CONCURRENCY CONTROL TESTS ---");
+
+    const testFarmerPhone = "9111111111";
+    const testOwnerPhone = "9222222222";
+
+    // Clean up any test records for these phone numbers
+    await pool.query("DELETE FROM user_otps WHERE phone IN (?, ?)", [testFarmerPhone, testOwnerPhone]);
+    await pool.query("DELETE FROM farmers WHERE user_id IN (SELECT id FROM users WHERE phone = ?)", [testFarmerPhone]);
+    await pool.query("DELETE FROM owners WHERE user_id IN (SELECT id FROM users WHERE phone = ?)", [testOwnerPhone]);
+    await pool.query("DELETE FROM users WHERE phone IN (?, ?)", [testFarmerPhone, testOwnerPhone]);
+
+    // 10.1 Farmer Registration
+    const resRegFarmer = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "Ramesh Farmer",
+            phone: testFarmerPhone,
+            email: "ramesh.farmer@example.com",
+            password: "SecurePassword123",
+            role: "FARMER",
+            location_id: 1,
+            address: "Green Field Village"
+        }
+    });
+    assert(
+        resRegFarmer.status === 201 && resRegFarmer.data?.data?.status === "PENDING",
+        "Farmer registration returns 201 with status PENDING",
+        JSON.stringify(resRegFarmer.data)
+    );
+    const regFarmerUserId = resRegFarmer.data?.data?.userId;
+    const regFarmerOtp = resRegFarmer.data?.data?.otp;
+
+    const [chkFarmerProfile] = await pool.query("SELECT * FROM farmers WHERE user_id = ?", [regFarmerUserId]);
+    assert(
+        chkFarmerProfile.length > 0 && chkFarmerProfile[0].location_id === 1,
+        "Farmer profile row created with location_id = 1",
+        JSON.stringify(chkFarmerProfile)
+    );
+
+    // 10.2 Duplicate phone registration rejection
+    const resDupReg = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "Duplicate Ramesh",
+            phone: testFarmerPhone,
+            password: "AnotherPassword123",
+            role: "FARMER"
+        }
+    });
+    assert(
+        resDupReg.status === 400 && resDupReg.data?.message?.includes("already exists"),
+        "Duplicate phone registration safely rejected with 400",
+        JSON.stringify(resDupReg.data)
+    );
+
+    // 10.3 Disallowed role registration rejection (e.g. SUPER_ADMIN)
+    const resAdminReg = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "Fake Admin",
+            phone: "9333333333",
+            password: "AdminPassword123",
+            role: "SUPER_ADMIN"
+        }
+    });
+    assert(
+        resAdminReg.status === 400 && resAdminReg.data?.message?.includes("only permitted for roles FARMER or OWNER"),
+        "Privileged role registration safely rejected with 400",
+        JSON.stringify(resAdminReg.data)
+    );
+
+    // 10.4 Owner Registration
+    const resRegOwner = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "Suresh Owner",
+            phone: testOwnerPhone,
+            email: "suresh.owner@example.com",
+            password: "OwnerPassword123",
+            role: "OWNER",
+            location_id: 1
+        }
+    });
+    assert(
+        resRegOwner.status === 201 && resRegOwner.data?.data?.role === "OWNER",
+        "Owner registration returns 201 with role OWNER",
+        JSON.stringify(resRegOwner.data)
+    );
+    const regOwnerUserId = resRegOwner.data?.data?.userId;
+
+    const [chkOwnerProfile] = await pool.query("SELECT * FROM owners WHERE user_id = ?", [regOwnerUserId]);
+    assert(
+        chkOwnerProfile.length > 0 && chkOwnerProfile[0].verification_status === "PENDING",
+        "Owner profile row created with verification_status = PENDING",
+        JSON.stringify(chkOwnerProfile)
+    );
+
+    // 10.5 Login rejected before OTP verification (status PENDING)
+    const resLoginPending = await apiRequest("/auth/login", {
+        method: "POST",
+        body: {
+            phone: testFarmerPhone,
+            password: "SecurePassword123"
+        }
+    });
+    assert(
+        resLoginPending.status === 403 && resLoginPending.data?.message?.includes("pending mobile OTP verification"),
+        "Login for unverified PENDING account safely rejected with 403",
+        JSON.stringify(resLoginPending.data)
+    );
+
+    // 10.6 OTP Dispatch Rate Limiting
+    const resSendOtpRateLimit = await apiRequest("/auth/otp/send", {
+        method: "POST",
+        body: { phone: testFarmerPhone }
+    });
+    assert(
+        resSendOtpRateLimit.status === 429 && resSendOtpRateLimit.data?.message?.includes("wait 60 seconds"),
+        "Immediate OTP resend rate-limited with 429 (within 60s cooldown)",
+        JSON.stringify(resSendOtpRateLimit.data)
+    );
+
+    // 10.7 Incorrect OTP verification failure
+    const resVerifyWrongOtp = await apiRequest("/auth/otp/verify", {
+        method: "POST",
+        body: {
+            phone: testFarmerPhone,
+            otp: "000000"
+        }
+    });
+    assert(
+        resVerifyWrongOtp.status === 400 && resVerifyWrongOtp.data?.message?.includes("Incorrect OTP"),
+        "Incorrect OTP verification rejected with 400 and increments retry counter",
+        JSON.stringify(resVerifyWrongOtp.data)
+    );
+
+    // 10.8 Correct OTP verification activates account and returns JWT
+    const resVerifyCorrectOtp = await apiRequest("/auth/otp/verify", {
+        method: "POST",
+        body: {
+            phone: testFarmerPhone,
+            otp: regFarmerOtp
+        }
+    });
+    assert(
+        resVerifyCorrectOtp.status === 200 && resVerifyCorrectOtp.data?.data?.token && resVerifyCorrectOtp.data?.data?.user?.status === "ACTIVE",
+        "Correct OTP verification activates account to ACTIVE and returns JWT token",
+        JSON.stringify(resVerifyCorrectOtp.data)
+    );
+    const authFarmerToken = resVerifyCorrectOtp.data?.data?.token;
+
+    // 10.9 Login with correct password
+    const resLoginSuccess = await apiRequest("/auth/login", {
+        method: "POST",
+        body: {
+            phone: testFarmerPhone,
+            password: "SecurePassword123"
+        }
+    });
+    assert(
+        resLoginSuccess.status === 200 && resLoginSuccess.data?.data?.token && resLoginSuccess.data?.data?.user?.role === "FARMER",
+        "Login with phone and password succeeds with 200 and role FARMER",
+        JSON.stringify(resLoginSuccess.data)
+    );
+
+    // 10.10 Login with incorrect password
+    const resLoginWrongPass = await apiRequest("/auth/login", {
+        method: "POST",
+        body: {
+            phone: testFarmerPhone,
+            password: "WrongPassword999"
+        }
+    });
+    assert(
+        resLoginWrongPass.status === 401 && resLoginWrongPass.data?.message?.includes("Invalid phone number or password"),
+        "Login with incorrect password safely rejected with 401",
+        JSON.stringify(resLoginWrongPass.data)
+    );
+
+    // 10.11 Authenticated profile fetch (GET /auth/me)
+    const resGetMe = await apiRequest("/auth/me", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${authFarmerToken}` }
+    });
+    assert(
+        resGetMe.status === 200 && resGetMe.data?.data?.phone === testFarmerPhone && resGetMe.data?.data?.role === "FARMER",
+        "GET /auth/me returns authenticated user identity with 200",
+        JSON.stringify(resGetMe.data)
+    );
+
+    // 10.12 CONCURRENCY CONTROL: Simultaneous double-booking prevention
+    // Create dedicated verified available equipment for concurrency testing
+    const [concEqRes] = await pool.query(
+        `INSERT INTO equipment (owner_id, location_id, category_id, name, equipment_type, price_per_day, status, verification_status)
+         VALUES (1, 1, 1, 'Concurrency Isolation Equipment', 'TRACTOR', 500, 'AVAILABLE', 'VERIFIED')`
+    );
+    const concEqId = concEqRes.insertId;
+
+    const concurrentDates = {
+        equipment_id: concEqId,
+        start_date: "2027-06-01",
+        end_date: "2027-06-05"
+    };
+
+    const [resBookA, resBookB] = await Promise.all([
+        apiRequest("/bookings", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${farmerToken}` },
+            body: concurrentDates
+        }),
+        apiRequest("/bookings", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${farmerToken}` },
+            body: concurrentDates
+        })
+    ]);
+
+    const bookStatuses = [resBookA.status, resBookB.status].sort();
+    assert(
+        bookStatuses[0] === 201 && bookStatuses[1] === 409,
+        "CONCURRENCY: Simultaneous booking requests serialized via SELECT ... FOR UPDATE (1 succeeded 201, 1 rejected 409)",
+        `Status A: ${resBookA.status}, Status B: ${resBookB.status}`
+    );
+
+    // 10.13 CONCURRENCY CONTROL: Simultaneous duplicate payment submission prevention
+    const winningBookingId = resBookA.status === 201 ? resBookA.data?.data?.bookingId : resBookB.data?.data?.bookingId;
+    await pool.query(
+        "UPDATE bookings SET status = 'ACCEPTED', payment_deadline = DATE_ADD(NOW(), INTERVAL 6 HOUR) WHERE id = ?",
+        [winningBookingId]
+    );
+
+    const [resPayA, resPayB] = await Promise.all([
+        apiRequest("/payments", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${farmerToken}` },
+            body: {
+                booking_id: winningBookingId,
+                transaction_id: `TXN_CONC_1_${Date.now()}`,
+                payment_method: "UPI"
+            }
+        }),
+        apiRequest("/payments", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${farmerToken}` },
+            body: {
+                booking_id: winningBookingId,
+                transaction_id: `TXN_CONC_2_${Date.now()}`,
+                payment_method: "UPI"
+            }
+        })
+    ]);
+
+    const payStatuses = [resPayA.status, resPayB.status].sort();
+    assert(
+        payStatuses[0] === 201 && payStatuses[1] === 400,
+        "CONCURRENCY: Simultaneous payment submissions serialized via SELECT ... FOR UPDATE (1 succeeded 201, 1 rejected 400)",
+        `Pay A: ${resPayA.status}, Pay B: ${resPayB.status}`
+    );
 
     // Clean up test server
     server.close();

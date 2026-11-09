@@ -9,13 +9,14 @@ const fileFilter = (req, file, cb) => {
         "image/jpg",
         "image/webp",
         "video/mp4",
-        "video/webm"
+        "video/webm",
+        "application/pdf"
     ];
 
     if (allowedTypes.includes(file.mimetype)) {
         cb(null, true);
     } else {
-        cb(new Error("Only JPG, JPEG, PNG, WEBP, MP4 and WEBM files are allowed"), false);
+        cb(new Error("Only JPG, JPEG, PNG, WEBP, MP4, WEBM and PDF files are allowed"), false);
     }
 };
 

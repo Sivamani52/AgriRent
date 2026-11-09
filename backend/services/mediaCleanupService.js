@@ -2,21 +2,36 @@ import pool from "../db.js";
 import cloudinary from "../config/cloudinary.js";
 
 /**
+ * Inspection media retention configuration (defaults to 48 hours and batch size of 25)
+ */
+const getRetentionHours = () => {
+    const val = parseInt(process.env.INSPECTION_MEDIA_RETENTION_HOURS, 10);
+    return isNaN(val) || val <= 0 ? 48 : val;
+};
+
+const getBatchLimit = () => {
+    const val = parseInt(process.env.INSPECTION_MEDIA_BATCH_LIMIT, 10);
+    return isNaN(val) || val <= 0 ? 25 : val;
+};
+
+/**
  * Checks whether a booking is completely safe for inspection media deletion.
  * Enforces all dispute protection and lifecycle completion rules.
  * 
  * Rules:
- * 1. Booking must be COMPLETED and return_completed_at must be at least 48 hours old.
+ * 1. Booking must be COMPLETED and return_completed_at must be at least RETENTION_HOURS (default 48) old.
  * 2. Booking status must not be DISPUTED.
- * 3. No unresolved disputes (status in 'OPEN', 'UNDER_ADMIN_REVIEW', 'ESCALATED_TO_SUPER_ADMIN')
+ * 3. No unresolved disputes (status in 'OPEN', 'UNDER_ADMIN_REVIEW', 'EVIDENCE_REQUESTED', 'ESCALATED_TO_SUPER_ADMIN')
  *    can exist in refund_disputes for this booking.
- * 4. If any resolved dispute exists, at least 48 hours must have elapsed since its resolution (resolved_at).
+ * 4. If any resolved dispute exists, at least RETENTION_HOURS must have elapsed since its resolution (resolved_at).
  * 
  * @param {object} connection - MySQL connection or pool
  * @param {number|string} bookingId - Target booking ID
  * @returns {Promise<{ isSafe: boolean, reason?: string }>}
  */
 export const isBookingSafeForMediaCleanup = async (connection, bookingId) => {
+    const retentionHours = getRetentionHours();
+
     // 1. Verify booking lifecycle status and return completion timestamp
     const [bookingRows] = await connection.query(
         `SELECT id, status, return_completed_at,
@@ -48,11 +63,11 @@ export const isBookingSafeForMediaCleanup = async (connection, bookingId) => {
         };
     }
 
-    // Must have passed the 48-hour post-return retention threshold
-    if (booking.hours_since_return < 48) {
+    // Must have passed the post-return retention threshold
+    if (booking.hours_since_return < retentionHours) {
         return {
             isSafe: false,
-            reason: `Retention period active: only ${booking.hours_since_return} hours elapsed since return (48 hours required)`
+            reason: `Retention period active: only ${booking.hours_since_return} hours elapsed since return (${retentionHours} hours required)`
         };
     }
 
@@ -61,7 +76,7 @@ export const isBookingSafeForMediaCleanup = async (connection, bookingId) => {
         `SELECT id, dispute_category, status, created_at
          FROM refund_disputes
          WHERE booking_id = ?
-           AND status IN ('OPEN', 'UNDER_ADMIN_REVIEW', 'ESCALATED_TO_SUPER_ADMIN')`,
+           AND status IN ('OPEN', 'UNDER_ADMIN_REVIEW', 'EVIDENCE_REQUESTED', 'ESCALATED_TO_SUPER_ADMIN')`,
         [bookingId]
     );
 
@@ -73,7 +88,7 @@ export const isBookingSafeForMediaCleanup = async (connection, bookingId) => {
         };
     }
 
-    // 3. Check for resolved disputes: Must respect 48-hour post-resolution grace period
+    // 3. Check for resolved disputes: Must respect post-resolution grace period
     const [resolvedDisputes] = await connection.query(
         `SELECT id, status, resolved_at,
                 TIMESTAMPDIFF(HOUR, resolved_at, NOW()) AS hours_since_resolution
@@ -92,10 +107,10 @@ export const isBookingSafeForMediaCleanup = async (connection, bookingId) => {
                 reason: `Dispute #${rd.id} marked ${rd.status} without a resolved_at timestamp. Evidence preserved.`
             };
         }
-        if (rd.hours_since_resolution < 48) {
+        if (rd.hours_since_resolution < retentionHours) {
             return {
                 isSafe: false,
-                reason: `Post-dispute grace period active: only ${rd.hours_since_resolution} hours since dispute #${rd.id} was resolved (48 hours required)`
+                reason: `Post-dispute grace period active: only ${rd.hours_since_resolution} hours since dispute #${rd.id} was resolved (${retentionHours} hours required)`
             };
         }
     }
@@ -161,19 +176,34 @@ export const deleteInspectionMediaBatch = async (connection, mediaItems) => {
 
 /**
  * Main scheduled task runner.
- * Scans for all completed bookings whose inspection media retention period (48h)
+ * Scans for all completed bookings whose inspection media retention period (default 48h)
  * has matured and dispute conditions are clear.
  * 
- * Persistent across server restarts: evaluates database timestamps.
+ * Distributed-safe via MySQL GET_LOCK, persistent across server restarts: evaluates database timestamps.
  */
 export const checkInspectionMediaCleanupTimeouts = async () => {
     let connection;
+    let lockAcquired = false;
+
     try {
         connection = await pool.getConnection();
 
+        // Distributed lock to prevent multi-instance race conditions
+        const [lockRows] = await connection.query(
+            "SELECT GET_LOCK('agrirent_media_cleanup_lock', 0) AS lock_acquired"
+        );
+        if (!lockRows || lockRows.length === 0 || lockRows[0].lock_acquired !== 1) {
+            // Another cluster worker/node is currently executing cleanup; skip this cycle safely
+            return;
+        }
+        lockAcquired = true;
+
+        const retentionHours = getRetentionHours();
+        const batchLimit = getBatchLimit();
+
         // 1. Identify candidate bookings:
         // - status = 'COMPLETED'
-        // - return_completed_at is at least 48 hours ago
+        // - return_completed_at is at least retentionHours ago
         // - contains at least one active (unpurged) inspection_media record
         const [candidateBookings] = await connection.query(
             `SELECT DISTINCT b.id AS booking_id, b.status, b.return_completed_at
@@ -181,8 +211,10 @@ export const checkInspectionMediaCleanupTimeouts = async () => {
              JOIN inspection_media im ON b.id = im.booking_id
              WHERE b.status = 'COMPLETED'
                AND b.return_completed_at IS NOT NULL
-               AND b.return_completed_at <= DATE_SUB(NOW(), INTERVAL 48 HOUR)
-               AND (im.is_deleted = FALSE OR im.is_deleted IS NULL)`
+               AND b.return_completed_at <= DATE_SUB(NOW(), INTERVAL ? HOUR)
+               AND (im.is_deleted = FALSE OR im.is_deleted IS NULL)
+             LIMIT ?`,
+            [retentionHours, batchLimit]
         );
 
         if (candidateBookings.length === 0) {
@@ -239,6 +271,13 @@ export const checkInspectionMediaCleanupTimeouts = async () => {
         console.error("[Media Cleanup] Error during media cleanup check:", error.message || error);
     } finally {
         if (connection) {
+            if (lockAcquired) {
+                try {
+                    await connection.query("SELECT RELEASE_LOCK('agrirent_media_cleanup_lock')");
+                } catch (relErr) {
+                    console.error("[Media Cleanup] Release lock error:", relErr.message);
+                }
+            }
             connection.release();
         }
     }

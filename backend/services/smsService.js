@@ -383,9 +383,58 @@ export const sendReturnDamageDisputeSMS = async ({ recipientPhone, recipientName
     });
 };
 
+/**
+ * Super Admin Decision Event: Decision issued on escalated dispute
+ */
+export const sendSuperAdminDisputeDecisionSMS = async ({ recipientPhone, recipientName, disputeId, bookingId, decision, remarks }) => {
+    return sendSMS({
+        phone: recipientPhone,
+        eventType: "SUPER_ADMIN_DISPUTE_DECISION",
+        message: `AgriRent Official Ruling: Super Admin has issued a final decision for Dispute #${disputeId} (Booking #${bookingId}): [${decision}]. ${remarks ? `Remarks: "${remarks}"` : ""}`
+    });
+};
+
+/**
+ * Super Admin Remand Event: Additional evidence/investigation requested from Area Admin
+ */
+export const sendAdditionalEvidenceRequestedSMS = async ({ adminPhone, adminName, disputeId, bookingId, instructions }) => {
+    return sendSMS({
+        phone: adminPhone,
+        eventType: "SUPER_ADMIN_EVIDENCE_REQUESTED",
+        message: `AgriRent Priority: Super Admin has remanded Dispute #${disputeId} (Booking #${bookingId}) for further evidence. Instructions: "${instructions || "Please collect additional details"}".`
+    });
+};
+
+/**
+ * Account Action Event: Warning, suspension, or permanent block issued to user
+ */
+export const sendAccountActionSMS = async ({ recipientPhone, recipientName, actionType, reason, duration }) => {
+    let msg = `AgriRent Notice: Hello ${recipientName || "User"}, your account has received an administrative action: [${actionType}]. Reason: "${reason || "Policy violation"}".`;
+    if (duration) {
+        msg += ` Duration: ${duration}.`;
+    }
+    return sendSMS({
+        phone: recipientPhone,
+        eventType: `ACCOUNT_ACTION_${actionType}`,
+        message: msg
+    });
+};
+
+/**
+ * Mobile OTP SMS
+ */
+export const sendOTPSMS = async ({ phone, otp }) => {
+    return sendSMS({
+        phone,
+        eventType: "AUTH_MOBILE_OTP",
+        message: `AgriRent: Your verification OTP is ${otp}. Valid for 5 minutes. Do not share this OTP with anyone.`
+    });
+};
+
 export default {
     sendSMS,
     normalizePhoneNumber,
+    sendOTPSMS,
     sendBookingRequestSMS,
     sendBookingReminderSMS,
     sendBookingAutoCancelledSMS,
@@ -402,5 +451,8 @@ export default {
     sendInspectionSubmittedSMS,
     sendHandoverCompletedSMS,
     sendReturnCompletedSMS,
-    sendReturnDamageDisputeSMS
+    sendReturnDamageDisputeSMS,
+    sendSuperAdminDisputeDecisionSMS,
+    sendAdditionalEvidenceRequestedSMS,
+    sendAccountActionSMS
 };
