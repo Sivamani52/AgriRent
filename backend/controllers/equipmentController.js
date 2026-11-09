@@ -1,4 +1,5 @@
 import pool from "../db.js";
+import { sendEquipmentStatusEmail } from "../services/notificationService.js";
 
 /**
  * Updates equipment status (e.g., AVAILABLE, BOOKED, MAINTENANCE, UNDER_INSPECTION).
@@ -212,7 +213,11 @@ export const updateEquipmentVerification = async (req, res) => {
         }
 
         const [equipment] = await pool.query(
-            "SELECT id, location_id FROM equipment WHERE id = ?",
+            `SELECT e.id, e.name, e.location_id, ou.email AS owner_email, ou.full_name AS owner_name
+             FROM equipment e
+             JOIN owners o ON e.owner_id = o.id
+             JOIN users ou ON o.user_id = ou.id
+             WHERE e.id = ?`,
             [equipmentId]
         );
 
@@ -262,6 +267,18 @@ export const updateEquipmentVerification = async (req, res) => {
                 equipmentId
             ]
         );
+
+        // Notify equipment owner via Brevo Email (non-blocking)
+        if (eq.owner_email) {
+            sendEquipmentStatusEmail({
+                ownerEmail: eq.owner_email,
+                ownerName: eq.owner_name,
+                equipmentName: eq.name,
+                status: newStatus,
+                verificationStatus: verification_status,
+                remarks: req.body.remarks || null
+            }).catch(err => console.error("Equipment status email error:", err));
+        }
 
         return res.status(200).json({
             success: true,

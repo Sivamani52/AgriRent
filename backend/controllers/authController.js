@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 import pool from "../db.js";
 import {
     sendOTPEmail,
+    sendRegistrationConfirmationEmail,
     sendPasswordResetOTPEmail,
     sendPasswordResetSuccessEmail
 } from "../services/notificationService.js";
@@ -317,7 +318,16 @@ export const verifyOTP = async (req, res) => {
 
         const user = users[0];
 
-        // 7. Issue JWT Token
+        // 7. Dispatch registration confirmation email (non-blocking)
+        if (user.email) {
+            sendRegistrationConfirmationEmail({
+                email: user.email,
+                name: user.full_name,
+                role: user.role
+            }).catch(err => console.error("Registration confirmation email error:", err));
+        }
+
+        // 8. Issue JWT Token
         const secret = process.env.JWT_SECRET;
         const token = jwt.sign(
             { id: user.id, role: user.role },

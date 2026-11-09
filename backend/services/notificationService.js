@@ -28,6 +28,31 @@ export const sendOTPEmail = async ({ email, name, otp }) => {
 };
 
 /**
+ * Registration Confirmation / Welcome Email
+ */
+export const sendRegistrationConfirmationEmail = async ({ email, name, role }) => {
+  return sendEmail({
+    to: email,
+    toName: name || "User",
+    subject: "Welcome to AgriRent! Your Account is Activated",
+    template: "bookingNotification.html",
+    templateData: {
+      title: "Account Activated",
+      badgeClass: "badge-success",
+      statusTitle: "Registration Successful",
+      statusMessage: `Welcome to AgriRent, ${name || "User"}! Your ${role || "member"} account has been verified and activated. You now have full access to agricultural equipment rentals.`,
+      bookingId: "N/A",
+      equipmentName: "Platform Services",
+      startDate: "N/A",
+      endDate: "N/A",
+      totalAmount: "N/A",
+      alertBoxClass: "info-box",
+      actionGuidance: "You can now log in, explore verified equipment, manage bookings, and coordinate secure rentals."
+    }
+  });
+};
+
+/**
  * Password Reset OTP Email
  */
 export const sendPasswordResetOTPEmail = async ({ email, name, otp }) => {
@@ -151,6 +176,63 @@ export const sendBookingAutoCancelledEmail = async ({ recipientEmail, recipientN
       actionGuidance: isOwner
         ? "Please monitor booking requests promptly to maintain a high response score."
         : "You can browse similar equipment in your area with instant availability."
+    }
+  });
+};
+
+/**
+ * Event: Equipment verification or status updated
+ */
+export const sendEquipmentStatusEmail = async ({ ownerEmail, ownerName, equipmentName, status, verificationStatus, remarks }) => {
+  const isVerified = verificationStatus === "VERIFIED";
+  return sendEmail({
+    to: ownerEmail,
+    toName: ownerName || "Equipment Owner",
+    subject: `Equipment Verification Update: "${equipmentName || "Equipment"}" - ${verificationStatus || status} - AgriRent`,
+    template: "bookingNotification.html",
+    templateData: {
+      title: `Equipment ${verificationStatus || status}`,
+      badgeClass: isVerified ? "badge-success" : "badge-danger",
+      statusTitle: `Verification Status: ${verificationStatus || status}`,
+      statusMessage: isVerified
+        ? `Congratulations! Your equipment "${equipmentName || "Equipment"}" has been verified and is now available for farmer bookings on AgriRent.`
+        : `Your equipment "${equipmentName || "Equipment"}" verification was not approved. ${remarks || "Please review equipment details and compliance standards."}`,
+      bookingId: "N/A",
+      equipmentName: equipmentName || "Agricultural Equipment",
+      startDate: "N/A",
+      endDate: "N/A",
+      totalAmount: "N/A",
+      alertBoxClass: isVerified ? "info-box" : "alert-box",
+      actionGuidance: isVerified
+        ? "Ensure equipment remains maintained and ready for inspections."
+        : "You may contact your local Area Administrator for guidance."
+    }
+  });
+};
+
+/**
+ * Event: Booking manually cancelled by Farmer or Admin
+ */
+export const sendBookingCancelledEmail = async ({ recipientEmail, recipientName, recipientRole, bookingId, equipmentName, reason }) => {
+  return sendEmail({
+    to: recipientEmail,
+    toName: recipientName || "User",
+    subject: `Booking #${bookingId} Cancelled - AgriRent`,
+    template: "bookingNotification.html",
+    templateData: {
+      title: "Booking Cancelled",
+      badgeClass: "badge-danger",
+      statusTitle: "Cancelled",
+      statusMessage: `Booking #${bookingId} for "${equipmentName || "Equipment"}" has been cancelled.`,
+      bookingId,
+      equipmentName: equipmentName || "Agricultural Equipment",
+      startDate: "N/A",
+      endDate: "N/A",
+      totalAmount: "0",
+      cancellationReasonRow: true,
+      cancellationReason: reason || "Cancelled by user",
+      alertBoxClass: "info-box",
+      actionGuidance: "If an advance payment was already submitted, refund processing will be initiated according to policy."
     }
   });
 };
@@ -644,10 +726,12 @@ export const sendAccountActionSMS = (args) => sendAccountActionEmail({ ...args, 
 
 export default {
   sendOTPEmail,
+  sendRegistrationConfirmationEmail,
   sendPasswordResetOTPEmail,
   sendPasswordResetSuccessEmail,
   sendBookingRequestEmail,
   sendBookingReminderEmail,
+  sendBookingCancelledEmail,
   sendBookingAutoCancelledEmail,
   sendBookingAcceptedEmail,
   sendBookingRejectedEmail,
@@ -666,6 +750,7 @@ export default {
   sendSuperAdminDisputeDecisionEmail,
   sendAdditionalEvidenceRequestedEmail,
   sendAccountActionEmail,
+  sendEquipmentStatusEmail,
   // Backward compatibility
   sendSMS,
   normalizePhoneNumber,

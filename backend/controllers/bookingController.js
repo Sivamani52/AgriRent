@@ -2,7 +2,8 @@ import pool from "../db.js";
 import {
     sendBookingRequestEmail,
     sendBookingAcceptedEmail,
-    sendBookingRejectedEmail
+    sendBookingRejectedEmail,
+    sendBookingCancelledEmail
 } from "../services/notificationService.js";
 
 export const createBooking = async (req, res) => {
@@ -29,6 +30,7 @@ export const createBooking = async (req, res) => {
         }
 
         let effectiveFarmerId;
+        let assistedByUserId = null;
 
         // Role-based farmer resolution and ownership check
         if (req.user.role === "FARMER") {
@@ -47,6 +49,7 @@ export const createBooking = async (req, res) => {
             }
 
             effectiveFarmerId = farmerRows[0].id;
+            assistedByUserId = null;
 
             // Reject if farmer attempts to specify a different farmer's ID
             if (farmer_id && Number(farmer_id) !== effectiveFarmerId) {
@@ -73,6 +76,7 @@ export const createBooking = async (req, res) => {
 
             const assistedFarmer = farmerRows[0];
             effectiveFarmerId = assistedFarmer.id;
+            assistedByUserId = req.user.id;
 
             // Restrict Area Admin to assigned area
             const adminLocationId = req.user.location_id;
@@ -229,6 +233,7 @@ export const createBooking = async (req, res) => {
                 `INSERT INTO bookings (
                     equipment_id,
                     farmer_id,
+                    assisted_by_user_id,
                     start_date,
                     end_date,
                     price_per_day,
@@ -236,10 +241,11 @@ export const createBooking = async (req, res) => {
                     advance_amount,
                     status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
                 [
                     equipment_id,
                     effectiveFarmerId,
+                    assistedByUserId,
                     start_date,
                     end_date,
                     pricePerDay,
@@ -266,6 +272,7 @@ export const createBooking = async (req, res) => {
                     bookingId: result.insertId,
                     equipmentId: Number(equipment_id),
                     farmerId: Number(effectiveFarmerId),
+                    assistedByUserId: assistedByUserId ? Number(assistedByUserId) : null,
                     startDate: start_date,
                     endDate: end_date,
                     rentalDays,
@@ -554,6 +561,159 @@ export const rejectBooking = async (req, res) => {
     }
 };
 
+/**
+ * Cancel a booking (FARMER owner of booking, AREA_ADMIN in assigned area / who assisted, or SUPER_ADMIN).
+ * Allowed when status is PENDING or ACCEPTED.
+ */
+export const cancelBooking = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        const { bookingId } = req.params;
+        const { reason } = req.body || {};
+
+        await connection.beginTransaction();
+
+        const [bookings] = await connection.query(
+            `SELECT
+                b.id,
+                b.status,
+                b.equipment_id,
+                b.farmer_id,
+                b.assisted_by_user_id,
+                f.user_id AS farmer_user_id,
+                f.location_id AS farmer_location_id,
+                fu.email AS farmer_email,
+                fu.phone AS farmer_phone,
+                fu.full_name AS farmer_name,
+                e.name AS equipment_name,
+                e.owner_id,
+                e.location_id AS equipment_location_id,
+                ou.email AS owner_email,
+                ou.phone AS owner_phone,
+                ou.full_name AS owner_name
+             FROM bookings b
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN owners o ON e.owner_id = o.id
+             JOIN users ou ON o.user_id = ou.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
+             WHERE b.id = ?
+             FOR UPDATE`,
+            [bookingId]
+        );
+
+        if (bookings.length === 0) {
+            await connection.rollback();
+            return res.status(404).json({ success: false, message: "Booking not found" });
+        }
+
+        const booking = bookings[0];
+
+        // Access control:
+        // Only the farmer who created the booking, an Area Admin in the relevant area (or who assisted), or Super Admin can cancel
+        const isBookingFarmer = req.user.role === "FARMER" && booking.farmer_user_id === req.user.id;
+        const isAreaAdmin = req.user.role === "AREA_ADMIN" && (
+            booking.assisted_by_user_id === req.user.id ||
+            !req.user.location_id ||
+            booking.farmer_location_id === req.user.location_id ||
+            booking.equipment_location_id === req.user.location_id
+        );
+        const isSuperAdmin = req.user.role === "SUPER_ADMIN";
+
+        if (!isBookingFarmer && !isAreaAdmin && !isSuperAdmin) {
+            await connection.rollback();
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to cancel this booking"
+            });
+        }
+
+        // Validate status: Only PENDING or ACCEPTED bookings can be cancelled
+        if (booking.status === "CANCELLED") {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "This booking is already cancelled"
+            });
+        }
+
+        if (booking.status !== "PENDING" && booking.status !== "ACCEPTED") {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: `Cannot cancel a booking in '${booking.status}' status`
+            });
+        }
+
+        const cancellationReason = (reason && reason.trim()) || "Cancelled by user";
+
+        await connection.query(
+            `UPDATE bookings
+             SET status = 'CANCELLED',
+                 cancellation_reason = ?,
+                 cancelled_at = CURRENT_TIMESTAMP
+             WHERE id = ?`,
+            [cancellationReason, bookingId]
+        );
+
+        // If there was an active payment, mark refund required
+        await connection.query(
+            `UPDATE booking_payments
+             SET status = 'PAYMENT_REJECTED',
+                 refund_status = 'REFUND_REQUIRED',
+                 refund_required_at = CURRENT_TIMESTAMP,
+                 refund_deadline = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 24 HOUR)
+             WHERE booking_id = ? AND status = 'PAYMENT_PENDING'`,
+            [bookingId]
+        );
+
+        await connection.commit();
+
+        // Dispatch notifications to owner and farmer (non-blocking)
+        if (booking.farmer_email) {
+            sendBookingCancelledEmail({
+                recipientEmail: booking.farmer_email,
+                recipientName: booking.farmer_name,
+                recipientRole: "FARMER",
+                bookingId: Number(bookingId),
+                equipmentName: booking.equipment_name,
+                reason: cancellationReason
+            }).catch(err => console.error("Cancel booking farmer email error:", err));
+        }
+
+        if (booking.owner_email) {
+            sendBookingCancelledEmail({
+                recipientEmail: booking.owner_email,
+                recipientName: booking.owner_name,
+                recipientRole: "OWNER",
+                bookingId: Number(bookingId),
+                equipmentName: booking.equipment_name,
+                reason: cancellationReason
+            }).catch(err => console.error("Cancel booking owner email error:", err));
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Booking cancelled successfully",
+            data: {
+                bookingId: Number(bookingId),
+                status: "CANCELLED",
+                cancellationReason
+            }
+        });
+
+    } catch (error) {
+        await connection.rollback();
+        console.error("Cancel booking error:", error);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to cancel booking"
+        });
+    } finally {
+        connection.release();
+    }
+};
+
 export const getBookingById = async (req, res) => {
     try {
         const { bookingId } = req.params;
@@ -567,6 +727,8 @@ export const getBookingById = async (req, res) => {
                 b.total_amount,
                 b.advance_amount,
                 b.status,
+                b.assisted_by_user_id,
+                au.full_name AS assisted_by_name,
                 b.cancellation_reason,
                 b.created_at,
 
@@ -604,6 +766,9 @@ export const getBookingById = async (req, res) => {
              JOIN users ou
                 ON o.user_id = ou.id
 
+             LEFT JOIN users au
+                ON b.assisted_by_user_id = au.id
+
              WHERE b.id = ?`,
             [bookingId]
         );
@@ -634,10 +799,13 @@ export const getBookingById = async (req, res) => {
                 });
             }
         } else if (role === "AREA_ADMIN") {
-            const matchesArea = adminLocationId && (
-                booking.equipment_location_id === adminLocationId ||
-                booking.farmer_location_id === adminLocationId ||
-                booking.owner_location_id === adminLocationId
+            const matchesArea = (
+                (adminLocationId && (
+                    booking.equipment_location_id === adminLocationId ||
+                    booking.farmer_location_id === adminLocationId ||
+                    booking.owner_location_id === adminLocationId
+                )) ||
+                booking.assisted_by_user_id === userId
             );
 
             if (!matchesArea) {

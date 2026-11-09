@@ -6,7 +6,8 @@ import {
     getFarmerBookings,
     getOwnerBookings,
     acceptBooking,
-    rejectBooking
+    rejectBooking,
+    cancelBooking
 } from "../controllers/bookingController.js";
 import { authenticateUser, authorizeRoles } from "../middleware/authMiddleware.js";
 
@@ -31,6 +32,13 @@ router.patch(
     authenticateUser,
     authorizeRoles("OWNER"),
     rejectBooking
+);
+
+router.patch(
+    "/bookings/:bookingId/cancel",
+    authenticateUser,
+    authorizeRoles("FARMER", "AREA_ADMIN", "SUPER_ADMIN"),
+    cancelBooking
 );
 
 router.get(

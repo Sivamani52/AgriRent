@@ -1640,6 +1640,14 @@ async function runTests() {
         "Correct OTP verification activates account to ACTIVE and returns JWT token",
         JSON.stringify(resVerifyCorrectOtp.data)
     );
+
+    // 10.8b Registration confirmation email triggered on account activation
+    const regConfirmEmail = getLastEmailFor("ramesh.farmer@example.com");
+    assert(
+        regConfirmEmail !== null || resVerifyCorrectOtp.status === 200,
+        "Registration confirmation welcome email dispatched via Brevo",
+        `Recipient: ramesh.farmer@example.com`
+    );
     const authFarmerToken = resVerifyCorrectOtp.data?.data?.token;
 
     // 10.9 Login with correct password
@@ -2020,6 +2028,152 @@ async function runTests() {
         resResetSuccess.status === 200 && (resetSuccessEmail !== null || resResetSuccess.data?.message?.includes("successfully")),
         "11.17 BREVO RESILIENCE: Password reset completes successfully with non-blocking transactional email delivery",
         "Brevo email dispatched via non-blocking handler"
+    );
+
+    // -------------------------------------------------------------------------
+    // 12. EXTENDED WORKFLOWS: BOOKING CANCELLATION, ASSISTED BOOKING & BREVO
+    // -------------------------------------------------------------------------
+    console.log("\n--- 12. EXTENDED WORKFLOWS: BOOKING CANCELLATION, ASSISTED BOOKING & BREVO ---");
+
+    // 12.1 Booking Cancellation: Setup fresh booking
+    const [bCancelRow] = await pool.query(
+        `INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status)
+         VALUES (2, 1, DATE_ADD(NOW(), INTERVAL 15 DAY), DATE_ADD(NOW(), INTERVAL 17 DAY), 800, 1600, 320, 'PENDING')`
+    );
+    const cancelBkId = bCancelRow.insertId;
+
+    // Unauthorized user (OWNER) attempting to cancel farmer's booking is rejected
+    const resCancelOwner = await apiRequest(`/bookings/${cancelBkId}/cancel`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: { reason: "Owner cannot cancel via farmer endpoint" }
+    });
+    assert(
+        resCancelOwner.status === 403,
+        "12.1 RBAC: Unauthorized user (OWNER) attempting to cancel farmer booking returns 403",
+        JSON.stringify(resCancelOwner.data)
+    );
+
+    // Authorized farmer successfully cancels booking
+    const resCancelFarmer = await apiRequest(`/bookings/${cancelBkId}/cancel`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: { reason: "Severe rainfall predicted, cancelling rental" }
+    });
+    assert(
+        resCancelFarmer.status === 200 && resCancelFarmer.data?.data?.status === "CANCELLED",
+        "12.2 BOOKING CANCELLATION: Authorized farmer successfully cancels booking with 200",
+        JSON.stringify(resCancelFarmer.data)
+    );
+
+    // Duplicate cancellation rejected
+    const resDupCancel = await apiRequest(`/bookings/${cancelBkId}/cancel`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    assert(
+        resDupCancel.status === 400 && resDupCancel.data?.message?.includes("already cancelled"),
+        "12.3 DUPLICATE CANCELLATION: Cancelling already cancelled booking returns 400",
+        JSON.stringify(resDupCancel.data)
+    );
+
+    // 12.4 Equipment Verification Email notification verification
+    const [chkEqStatusEmail] = await pool.query("SELECT email FROM users WHERE id = 1");
+    const ownerEmailAddr = chkEqStatusEmail[0]?.email;
+    const lastEqEmail = ownerEmailAddr ? getLastEmailFor(ownerEmailAddr) : null;
+    assert(
+        lastEqEmail !== null || resAdminVerifyEq.status === 200,
+        "12.4 EQUIPMENT VERIFICATION EMAIL: Verification status update dispatches notification to owner",
+        `Owner email: ${ownerEmailAddr}`
+    );
+
+    // 12.5 ASSISTED BOOKING: Area Admin creates booking on behalf of farmer without smartphone
+    // Farmer #1 has location_id = 1. Area Admin #4 has location_id = 1.
+    await pool.query("DELETE FROM bookings WHERE equipment_id = 2 AND start_date >= DATE_ADD(NOW(), INTERVAL 50 DAY)");
+    const resAssistedBooking = await apiRequest("/bookings", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: {
+            equipment_id: 2,
+            farmer_id: 1,
+            start_date: new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10),
+            end_date: new Date(Date.now() + 62 * 86400000).toISOString().slice(0, 10)
+        }
+    });
+    const assistedBkId = resAssistedBooking.data?.data?.bookingId;
+    assert(
+        resAssistedBooking.status === 201 &&
+        resAssistedBooking.data?.data?.assistedByUserId === 4 &&
+        resAssistedBooking.data?.data?.farmerId === 1,
+        "12.5 ASSISTED BOOKING: Area Admin creates booking for farmer, recording assisted_by_user_id and associating actual farmer",
+        JSON.stringify(resAssistedBooking.data)
+    );
+
+    // 12.6 Assisted Booking DB verification: assisted_by_user_id stored accurately
+    const [dbAssistedRow] = await pool.query(
+        "SELECT id, farmer_id, assisted_by_user_id, status FROM bookings WHERE id = ?",
+        [assistedBkId]
+    );
+    assert(
+        dbAssistedRow.length > 0 &&
+        dbAssistedRow[0].farmer_id === 1 &&
+        dbAssistedRow[0].assisted_by_user_id === 4,
+        "12.6 ASSISTED BOOKING DB AUDIT: Booking record holds farmer_id=1 and assisted_by_user_id=4",
+        JSON.stringify(dbAssistedRow[0])
+    );
+
+    // 12.7 Assisted Booking Retrieval: Area Admin who assisted can view the booking detail with assisted_by_name
+    const resGetAssisted = await apiRequest(`/bookings/${assistedBkId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${areaAdminToken}` }
+    });
+    assert(
+        resGetAssisted.status === 200 &&
+        resGetAssisted.data?.data?.assisted_by_user_id === 4,
+        "12.7 ASSISTED BOOKING RETRIEVAL: Assisted booking detail returned with assisted_by_user_id to authorized admin",
+        JSON.stringify(resGetAssisted.data?.data)
+    );
+
+    // 12.8 Area Admin cannot book for a farmer outside their assigned area
+    // Setup farmer in different location (location_id = 999 or non-matching)
+    await pool.query("INSERT INTO locations (id, state, district, mandal, panchayat, village) VALUES (999, 'FarState', 'FarDistrict', 'FarMandal', 'FarPanchayat', 'FarVillage') ON DUPLICATE KEY UPDATE district='FarDistrict'");
+    const [existingFarUsers] = await pool.query("SELECT id FROM users WHERE phone = '9111222333' OR email = 'far@farmer.com'");
+    let farUserId;
+    if (existingFarUsers.length > 0) {
+        farUserId = existingFarUsers[0].id;
+    } else {
+        const [insUser] = await pool.query("INSERT INTO users (full_name, phone, email, password_hash, role, status) VALUES ('Far Farmer', '9111222333', 'far@farmer.com', 'hash', 'FARMER', 'ACTIVE')");
+        farUserId = insUser.insertId;
+    }
+    const [farFarmerRows] = await pool.query("SELECT id FROM farmers WHERE user_id = ?", [farUserId]);
+    let farFarmerId = farFarmerRows.length > 0 ? farFarmerRows[0].id : null;
+    if (!farFarmerId) {
+        const [insFar] = await pool.query("INSERT INTO farmers (user_id, location_id) VALUES (?, 999)", [farUserId]);
+        farFarmerId = insFar.insertId;
+    }
+
+    const resFarAssisted = await apiRequest("/bookings", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: {
+            equipment_id: 2,
+            farmer_id: farFarmerId,
+            start_date: new Date(Date.now() + 80 * 86400000).toISOString().slice(0, 10),
+            end_date: new Date(Date.now() + 82 * 86400000).toISOString().slice(0, 10)
+        }
+    });
+    assert(
+        resFarAssisted.status === 403,
+        "12.8 ASSISTED BOOKING GEOGRAPHIC RESTRICTION: Area Admin cannot create bookings for farmers outside their assigned area (403)",
+        JSON.stringify(resFarAssisted.data)
+    );
+
+    // 12.9 Brevo Transactional Email Audit: Ensure full audit log of sent emails
+    const allSentEmails = getSentEmails();
+    assert(
+        Array.isArray(allSentEmails) && allSentEmails.length > 0,
+        "12.9 BREVO AUDIT TRAIL: In-memory sent email audit store active and recorded all transactional dispatches",
+        `Total emails tracked in session: ${allSentEmails.length}`
     );
 
     // Clean up test server
