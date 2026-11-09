@@ -13,6 +13,9 @@ import {
     checkPaymentVerificationTimeouts, 
     checkBookingAcceptanceTimeouts 
 } from "./services/paymentTimeoutService.js";
+import {
+    checkInspectionMediaCleanupTimeouts
+} from "./services/mediaCleanupService.js";
 
 const app = express();
 
@@ -58,6 +61,7 @@ const PORT = process.env.PORT || 5000;
 const runTimeoutChecks = async () => {
     await checkPaymentVerificationTimeouts();
     await checkBookingAcceptanceTimeouts();
+    await checkInspectionMediaCleanupTimeouts();
 };
 
 setInterval(runTimeoutChecks, 60 * 1000);

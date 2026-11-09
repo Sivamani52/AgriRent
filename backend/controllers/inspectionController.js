@@ -511,12 +511,21 @@ export const getInitialInspection = async (req, res) => {
         // Fetch media for each inspection
         for (const insp of inspections) {
             const [media] = await pool.query(
-                `SELECT id, media_type, file_url, public_id, created_at
+                `SELECT id, media_type, file_url, public_id, is_deleted, deleted_at, created_at
                  FROM inspection_media
                  WHERE inspection_id = ?`,
                 [insp.id]
             );
-            insp.media = media;
+            insp.media = media.map(m => ({
+                id: m.id,
+                media_type: m.media_type,
+                file_url: m.is_deleted ? null : m.file_url,
+                public_id: m.public_id,
+                is_deleted: Boolean(m.is_deleted),
+                deleted_at: m.deleted_at,
+                created_at: m.created_at,
+                status: m.is_deleted ? "PURGED_AFTER_RETENTION_PERIOD" : "ACTIVE"
+            }));
         }
 
         const ownerInspection = inspections.find(i => i.inspector_role === "OWNER") || null;
@@ -1080,12 +1089,21 @@ export const getFinalInspection = async (req, res) => {
 
         for (const insp of inspections) {
             const [media] = await pool.query(
-                `SELECT id, media_type, file_url, public_id, created_at
+                `SELECT id, media_type, file_url, public_id, is_deleted, deleted_at, created_at
                  FROM inspection_media
                  WHERE inspection_id = ?`,
                 [insp.id]
             );
-            insp.media = media;
+            insp.media = media.map(m => ({
+                id: m.id,
+                media_type: m.media_type,
+                file_url: m.is_deleted ? null : m.file_url,
+                public_id: m.public_id,
+                is_deleted: Boolean(m.is_deleted),
+                deleted_at: m.deleted_at,
+                created_at: m.created_at,
+                status: m.is_deleted ? "PURGED_AFTER_RETENTION_PERIOD" : "ACTIVE"
+            }));
         }
 
         const ownerInspection = inspections.find(i => i.inspector_role === "OWNER") || null;
@@ -1139,12 +1157,21 @@ export const getFullInspectionHistory = async (req, res) => {
 
         for (const insp of allInspections) {
             const [media] = await pool.query(
-                `SELECT id, media_type, file_url, public_id, created_at
+                `SELECT id, media_type, file_url, public_id, is_deleted, deleted_at, created_at
                  FROM inspection_media
                  WHERE inspection_id = ?`,
                 [insp.id]
             );
-            insp.media = media;
+            insp.media = media.map(m => ({
+                id: m.id,
+                media_type: m.media_type,
+                file_url: m.is_deleted ? null : m.file_url,
+                public_id: m.public_id,
+                is_deleted: Boolean(m.is_deleted),
+                deleted_at: m.deleted_at,
+                created_at: m.created_at,
+                status: m.is_deleted ? "PURGED_AFTER_RETENTION_PERIOD" : "ACTIVE"
+            }));
         }
 
         const initialOwner = allInspections.find(i => i.inspection_stage === "INITIAL" && i.inspector_role === "OWNER") || null;

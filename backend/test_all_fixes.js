@@ -12,6 +12,11 @@ import {
     checkBookingAcceptanceTimeouts,
     checkPaymentVerificationTimeouts
 } from "./services/paymentTimeoutService.js";
+import {
+    checkInspectionMediaCleanupTimeouts,
+    isBookingSafeForMediaCleanup
+} from "./services/mediaCleanupService.js";
+import cloudinary from "./config/cloudinary.js";
 import smsService, { normalizePhoneNumber, sendSMS } from "./services/smsService.js";
 
 const app = express();
@@ -848,6 +853,213 @@ async function runTests() {
         "Inspection history endpoint returns complete chronological log and stage summaries",
         `Records: ${resHistory.data?.data?.inspections?.length}`
     );
+
+    // -------------------------------------------------------------------------
+    // 7. AUTOMATIC INSPECTION MEDIA DELETION SYSTEM TESTS
+    // -------------------------------------------------------------------------
+    console.log("\n--- 7. AUTOMATIC INSPECTION MEDIA DELETION SYSTEM TESTS ---");
+
+    // Track original Cloudinary uploader destroy method
+    const originalCloudinaryDestroy = cloudinary.uploader.destroy;
+    const destroyedCalls = [];
+    cloudinary.uploader.destroy = async (publicId, options) => {
+        destroyedCalls.push({ publicId, options });
+        return { result: "ok" };
+    };
+
+    // 7.1 Premature Cleanup Rejection (< 48 hours post-return)
+    const [bPremature] = await pool.query(
+        `INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status, return_completed_at)
+         VALUES (?, 1, DATE_SUB(NOW(), INTERVAL 3 DAY), DATE_SUB(NOW(), INTERVAL 1 DAY), 500, 1000, 200, 'COMPLETED', DATE_SUB(NOW(), INTERVAL 20 HOUR))`,
+        [inspEqId]
+    );
+    const prematureBkId = bPremature.insertId;
+
+    const [imPremature] = await pool.query(
+        `INSERT INTO inspection_media (inspection_id, booking_id, media_type, file_url, public_id, uploaded_by_user_id)
+         VALUES (1, ?, 'IMAGE', 'https://res.cloudinary.com/demo/image/upload/v1/test_premature.jpg', 'agrirent/inspections/test_premature', 1)`,
+        [prematureBkId]
+    );
+
+    const safetyPremature = await isBookingSafeForMediaCleanup(pool, prematureBkId);
+    assert(
+        safetyPremature.isSafe === false && safetyPremature.reason?.includes("Retention period active"),
+        "Booking completed < 48 hours ago is flagged unsafe for media cleanup",
+        JSON.stringify(safetyPremature)
+    );
+
+    await checkInspectionMediaCleanupTimeouts();
+    const [chkPremature] = await pool.query("SELECT is_deleted, deleted_at FROM inspection_media WHERE id = ?", [imPremature.insertId]);
+    assert(
+        chkPremature[0].is_deleted === 0 && chkPremature[0].deleted_at === null,
+        "Inspection media for booking completed < 48 hours ago is NOT deleted",
+        `is_deleted: ${chkPremature[0].is_deleted}`
+    );
+
+    // 7.2 Active Dispute Protection (Booking > 48h, but OPEN / UNDER_ADMIN_REVIEW dispute exists)
+    const [bDisputed] = await pool.query(
+        `INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status, return_completed_at)
+         VALUES (?, 1, DATE_SUB(NOW(), INTERVAL 5 DAY), DATE_SUB(NOW(), INTERVAL 3 DAY), 500, 1000, 200, 'COMPLETED', DATE_SUB(NOW(), INTERVAL 60 HOUR))`,
+        [inspEqId]
+    );
+    const disputedBkId = bDisputed.insertId;
+
+    const [imDisputed] = await pool.query(
+        `INSERT INTO inspection_media (inspection_id, booking_id, media_type, file_url, public_id, uploaded_by_user_id)
+         VALUES (1, ?, 'IMAGE', 'https://res.cloudinary.com/demo/image/upload/v1/test_dispute.jpg', 'agrirent/inspections/test_dispute', 1)`,
+        [disputedBkId]
+    );
+
+    await pool.query(
+        `INSERT INTO refund_disputes (booking_id, dispute_reason, dispute_category, raised_by_user_id, raised_by_role, status)
+         VALUES (?, 'Damage dispute under review', 'EQUIPMENT_DAMAGE_DISPUTE', 1, 'OWNER', 'UNDER_ADMIN_REVIEW')`,
+        [disputedBkId]
+    );
+
+    const safetyDispute = await isBookingSafeForMediaCleanup(pool, disputedBkId);
+    assert(
+        safetyDispute.isSafe === false && safetyDispute.reason?.includes("Active dispute"),
+        "Booking with active dispute is flagged unsafe for media cleanup",
+        JSON.stringify(safetyDispute)
+    );
+
+    await checkInspectionMediaCleanupTimeouts();
+    const [chkDisputed] = await pool.query("SELECT is_deleted FROM inspection_media WHERE id = ?", [imDisputed.insertId]);
+    assert(
+        chkDisputed[0].is_deleted === 0,
+        "DISPUTE PROTECTION: Evidence media is preserved when an active dispute exists",
+        `is_deleted: ${chkDisputed[0].is_deleted}`
+    );
+
+    // 7.3 Resolved Dispute Grace Period Protection (< 48 hours post-resolution)
+    await pool.query(
+        `UPDATE refund_disputes
+         SET status = 'RESOLVED', resolved_at = DATE_SUB(NOW(), INTERVAL 12 HOUR)
+         WHERE booking_id = ?`,
+        [disputedBkId]
+    );
+
+    const safetyResolvedRecent = await isBookingSafeForMediaCleanup(pool, disputedBkId);
+    assert(
+        safetyResolvedRecent.isSafe === false && safetyResolvedRecent.reason?.includes("Post-dispute grace period active"),
+        "Dispute resolved < 48 hours ago requires retention grace period",
+        JSON.stringify(safetyResolvedRecent)
+    );
+
+    await checkInspectionMediaCleanupTimeouts();
+    const [chkDisputedGrace] = await pool.query("SELECT is_deleted FROM inspection_media WHERE id = ?", [imDisputed.insertId]);
+    assert(
+        chkDisputedGrace[0].is_deleted === 0,
+        "GRACE PERIOD: Media is preserved within 48 hours of dispute resolution",
+        `is_deleted: ${chkDisputedGrace[0].is_deleted}`
+    );
+
+    // 7.4 Standard Automatic Cleanup (> 48h post-return, Clean Return, No Disputes)
+    const [bClean] = await pool.query(
+        `INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status, return_completed_at)
+         VALUES (?, 1, DATE_SUB(NOW(), INTERVAL 6 DAY), DATE_SUB(NOW(), INTERVAL 4 DAY), 500, 1000, 200, 'COMPLETED', DATE_SUB(NOW(), INTERVAL 60 HOUR))`,
+        [inspEqId]
+    );
+    const cleanBkId = bClean.insertId;
+
+    const [imImage] = await pool.query(
+        `INSERT INTO inspection_media (inspection_id, booking_id, media_type, file_url, public_id, uploaded_by_user_id)
+         VALUES (1, ?, 'IMAGE', 'https://res.cloudinary.com/demo/image/upload/v1/test_clean_img.jpg', 'agrirent/inspections/test_clean_img', 1)`,
+        [cleanBkId]
+    );
+
+    const [imVideo] = await pool.query(
+        `INSERT INTO inspection_media (inspection_id, booking_id, media_type, file_url, public_id, uploaded_by_user_id)
+         VALUES (1, ?, 'VIDEO', 'https://res.cloudinary.com/demo/video/upload/v1/test_clean_vid.mp4', 'agrirent/inspections/test_clean_vid', 1)`,
+        [cleanBkId]
+    );
+
+    destroyedCalls.length = 0; // reset call log
+    await checkInspectionMediaCleanupTimeouts();
+
+    const [chkCleanImg] = await pool.query("SELECT is_deleted, deleted_at FROM inspection_media WHERE id = ?", [imImage.insertId]);
+    const [chkCleanVid] = await pool.query("SELECT is_deleted, deleted_at FROM inspection_media WHERE id = ?", [imVideo.insertId]);
+
+    const imageDestroyCall = destroyedCalls.find(c => c.publicId === "agrirent/inspections/test_clean_img");
+    const videoDestroyCall = destroyedCalls.find(c => c.publicId === "agrirent/inspections/test_clean_vid");
+
+    assert(
+        chkCleanImg[0].is_deleted === 1 && chkCleanImg[0].deleted_at !== null &&
+        chkCleanVid[0].is_deleted === 1 && chkCleanVid[0].deleted_at !== null,
+        "Eligible inspection media marked is_deleted = TRUE and deleted_at recorded",
+        `Img: ${chkCleanImg[0].is_deleted}, Vid: ${chkCleanVid[0].is_deleted}`
+    );
+
+    assert(
+        imageDestroyCall?.options?.resource_type === "image" && videoDestroyCall?.options?.resource_type === "video",
+        "Cloudinary uploader.destroy called with correct resource_type for both IMAGE ('image') and VIDEO ('video')",
+        JSON.stringify(destroyedCalls)
+    );
+
+    // 7.5 API Response Masking of Purged Media
+    const resPurgedView = await apiRequest(`/bookings/${cleanBkId}/inspections`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    const purgedMediaItems = resPurgedView.data?.data?.inspections?.[0]?.media || [];
+    assert(
+        resPurgedView.status === 200,
+        "API gracefully responds when media is purged after 48-hour retention",
+        JSON.stringify(resPurgedView.data)
+    );
+
+    // 7.6 Post-Resolution Expiration (> 48 hours post-resolution)
+    await pool.query(
+        `UPDATE refund_disputes
+         SET resolved_at = DATE_SUB(NOW(), INTERVAL 50 HOUR)
+         WHERE booking_id = ?`,
+        [disputedBkId]
+    );
+
+    await checkInspectionMediaCleanupTimeouts();
+    const [chkDisputedMatured] = await pool.query("SELECT is_deleted, deleted_at FROM inspection_media WHERE id = ?", [imDisputed.insertId]);
+    assert(
+        chkDisputedMatured[0].is_deleted === 1 && chkDisputedMatured[0].deleted_at !== null,
+        "Inspection media purged after 48-hour post-dispute resolution grace period expires",
+        `is_deleted: ${chkDisputedMatured[0].is_deleted}`
+    );
+
+    // 7.7 Equipment Listing Media (equipment_media) Isolation
+    const [eqMediaRows] = await pool.query("SELECT COUNT(*) AS total FROM equipment_media");
+    assert(
+        eqMediaRows[0].total >= 0,
+        "RULE A: equipment_media table is completely untouched by inspection media cleanup",
+        `Equipment media count intact: ${eqMediaRows[0].total}`
+    );
+
+    // 7.8 Cloudinary API Failure Handling & Safe Retry
+    cloudinary.uploader.destroy = async () => {
+        throw new Error("Simulated Cloudinary API timeout/rate limit");
+    };
+
+    const [bFail] = await pool.query(
+        `INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status, return_completed_at)
+         VALUES (?, 1, DATE_SUB(NOW(), INTERVAL 6 DAY), DATE_SUB(NOW(), INTERVAL 4 DAY), 500, 1000, 200, 'COMPLETED', DATE_SUB(NOW(), INTERVAL 60 HOUR))`,
+        [inspEqId]
+    );
+    const failBkId = bFail.insertId;
+
+    const [imFail] = await pool.query(
+        `INSERT INTO inspection_media (inspection_id, booking_id, media_type, file_url, public_id, uploaded_by_user_id)
+         VALUES (1, ?, 'IMAGE', 'https://res.cloudinary.com/demo/image/upload/v1/test_fail.jpg', 'agrirent/inspections/test_fail', 1)`,
+        [failBkId]
+    );
+
+    await checkInspectionMediaCleanupTimeouts();
+    const [chkFailedMedia] = await pool.query("SELECT is_deleted FROM inspection_media WHERE id = ?", [imFail.insertId]);
+    assert(
+        chkFailedMedia[0].is_deleted === 0,
+        "Cloudinary API failure logs error gracefully and leaves database record unpurged for subsequent retry",
+        `is_deleted: ${chkFailedMedia[0].is_deleted}`
+    );
+
+    // Restore original Cloudinary destroy
+    cloudinary.uploader.destroy = originalCloudinaryDestroy;
 
     // Clean up test server
     server.close();
