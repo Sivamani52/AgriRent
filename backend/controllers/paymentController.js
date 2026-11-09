@@ -1,5 +1,17 @@
 import pool from "../db.js";
+import {
+    sendPaymentSubmittedSMS,
+    sendPaymentVerifiedSMS,
+    sendPaymentRejectedSMS,
+    sendRefundInitiatedSMS,
+    sendRefundDisputeSMS,
+    sendAreaAdminDisputeSMS
+} from "../services/smsService.js";
 
+/**
+ * Farmer submits advance payment for an accepted booking.
+ * Access: Authenticated FARMER associated with the booking.
+ */
 export const submitPayment = async (req, res) => {
     try {
         const { booking_id, transaction_id, payment_method } = req.body;
@@ -20,13 +32,22 @@ export const submitPayment = async (req, res) => {
 
         const [bookings] = await pool.query(
             `SELECT 
-                id,
-                advance_amount,
-                status,
-                payment_deadline,
-                (payment_deadline > NOW()) AS payment_window_open
-            FROM bookings
-            WHERE id = ?`,
+                b.id,
+                b.farmer_id,
+                b.advance_amount,
+                b.status,
+                b.payment_deadline,
+                (b.payment_deadline > NOW()) AS payment_window_open,
+                f.user_id AS farmer_user_id,
+                ou.phone AS owner_phone,
+                ou.full_name AS owner_name,
+                e.name AS equipment_name
+            FROM bookings b
+            JOIN farmers f ON b.farmer_id = f.id
+            JOIN equipment e ON b.equipment_id = e.id
+            JOIN owners o ON e.owner_id = o.id
+            JOIN users ou ON o.user_id = ou.id
+            WHERE b.id = ?`,
             [booking_id]
         );
 
@@ -39,20 +60,28 @@ export const submitPayment = async (req, res) => {
 
         const booking = bookings[0];
 
-         if (!booking.payment_window_open) {
-                await pool.query(
-                    `UPDATE bookings
-                    SET status = 'CANCELLED',
-                        cancellation_reason = 'Payment deadline expired'
-                    WHERE id = ?`,
-                    [booking_id]
-                );
+        // IDOR Prevention: Only the farmer associated with this booking can pay
+        if (booking.farmer_user_id !== req.user.id) {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to submit payment for this booking"
+            });
+        }
 
-                return res.status(400).json({
-                    success: false,
-                    message: "Payment deadline has expired. Booking has been cancelled."
-                });
-            }
+        if (!booking.payment_window_open) {
+            await pool.query(
+                `UPDATE bookings
+                 SET status = 'CANCELLED',
+                     cancellation_reason = 'Payment deadline expired'
+                 WHERE id = ?`,
+                [booking_id]
+            );
+
+            return res.status(400).json({
+                success: false,
+                message: "Payment deadline has expired. Booking has been cancelled."
+            });
+        }
 
         if (booking.status !== "ACCEPTED") {
             return res.status(400).json({
@@ -94,6 +123,15 @@ export const submitPayment = async (req, res) => {
             ]
         );
 
+        // Send SMS notification to owner (Event 6)
+        sendPaymentSubmittedSMS({
+            ownerPhone: booking.owner_phone,
+            ownerName: booking.owner_name,
+            bookingId: booking_id,
+            amount: booking.advance_amount,
+            transactionId: transaction_id.trim()
+        }).catch(err => console.error("Payment submitted SMS error:", err));
+
         return res.status(201).json({
             success: true,
             message: "Payment details submitted successfully. Waiting for owner verification.",
@@ -117,26 +155,45 @@ export const submitPayment = async (req, res) => {
     }
 };
 
-
+/**
+ * Owner verifies advance payment.
+ * Protected with MySQL transactions and SELECT ... FOR UPDATE row locking.
+ * Access: Authenticated equipment OWNER of this booking only.
+ */
 export const verifyPayment = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
         const { paymentId } = req.params;
 
-        const [payments] = await pool.query(
+        await connection.beginTransaction();
+
+        // Row-locking payment and booking records
+        const [payments] = await connection.query(
             `SELECT
                 bp.id,
                 bp.booking_id,
                 bp.amount,
                 bp.transaction_id,
                 bp.status,
-                b.status AS booking_status
+                b.status AS booking_status,
+                b.equipment_id,
+                o.user_id AS owner_user_id,
+                fu.phone AS farmer_phone,
+                fu.full_name AS farmer_name,
+                e.name AS equipment_name
              FROM booking_payments bp
              JOIN bookings b ON bp.booking_id = b.id
-             WHERE bp.id = ?`,
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN owners o ON e.owner_id = o.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
+             WHERE bp.id = ?
+             FOR UPDATE`,
             [paymentId]
         );
 
         if (payments.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 success: false,
                 message: "Payment not found"
@@ -145,7 +202,25 @@ export const verifyPayment = async (req, res) => {
 
         const payment = payments[0];
 
+        // Authorization check: Only authorized owner of this booking can verify
+        if (payment.owner_user_id !== req.user.id) {
+            await connection.rollback();
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to verify payment for this booking"
+            });
+        }
+
+        if (payment.status === "PAYMENT_VERIFIED") {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Payment has already been verified"
+            });
+        }
+
         if (payment.status !== "PAYMENT_PENDING") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Only pending payments can be verified"
@@ -153,13 +228,21 @@ export const verifyPayment = async (req, res) => {
         }
 
         if (payment.booking_status !== "ACCEPTED") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Booking is not in accepted status"
             });
         }
 
-        await pool.query(
+        // Lock booking row as well
+        await connection.query(
+            "SELECT id FROM bookings WHERE id = ? FOR UPDATE",
+            [payment.booking_id]
+        );
+
+        // Update payment status
+        await connection.query(
             `UPDATE booking_payments
              SET status = 'PAYMENT_VERIFIED',
                  verified_at = CURRENT_TIMESTAMP
@@ -167,12 +250,31 @@ export const verifyPayment = async (req, res) => {
             [paymentId]
         );
 
-        await pool.query(
+        // Update booking status
+        await connection.query(
             `UPDATE bookings
              SET status = 'CONFIRMED'
              WHERE id = ?`,
             [payment.booking_id]
         );
+
+        // Update equipment status to BOOKED if it was AVAILABLE
+        await connection.query(
+            `UPDATE equipment
+             SET status = 'BOOKED'
+             WHERE id = ? AND status = 'AVAILABLE'`,
+            [payment.equipment_id]
+        );
+
+        await connection.commit();
+
+        // Send SMS to Farmer (Event 7, non-blocking)
+        sendPaymentVerifiedSMS({
+            farmerPhone: payment.farmer_phone,
+            farmerName: payment.farmer_name,
+            bookingId: payment.booking_id,
+            amount: payment.amount
+        }).catch(err => console.error("Payment verified SMS error:", err));
 
         return res.status(200).json({
             success: true,
@@ -188,16 +290,24 @@ export const verifyPayment = async (req, res) => {
         });
 
     } catch (error) {
+        await connection.rollback();
         console.error("Verify payment error:", error.message || error);
-
         return res.status(500).json({
             success: false,
             message: "Failed to verify payment"
         });
+    } finally {
+        connection.release();
     }
 };
 
+/**
+ * Owner rejects advance payment.
+ * Protected with MySQL transactions and SELECT ... FOR UPDATE row locking.
+ * Access: Authenticated equipment OWNER of this booking only.
+ */
 export const rejectPayment = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
         const { paymentId } = req.params;
         const { reason } = req.body;
@@ -209,19 +319,32 @@ export const rejectPayment = async (req, res) => {
             });
         }
 
-        const [payments] = await pool.query(
+        await connection.beginTransaction();
+
+        const [payments] = await connection.query(
             `SELECT
                 bp.id,
                 bp.booking_id,
+                bp.amount,
                 bp.status,
-                b.status AS booking_status
+                b.status AS booking_status,
+                b.equipment_id,
+                o.user_id AS owner_user_id,
+                fu.phone AS farmer_phone,
+                fu.full_name AS farmer_name
              FROM booking_payments bp
              JOIN bookings b ON bp.booking_id = b.id
-             WHERE bp.id = ?`,
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN owners o ON e.owner_id = o.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
+             WHERE bp.id = ?
+             FOR UPDATE`,
             [paymentId]
         );
 
         if (payments.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 success: false,
                 message: "Payment not found"
@@ -230,7 +353,17 @@ export const rejectPayment = async (req, res) => {
 
         const payment = payments[0];
 
+        // Authorization check: Only authorized owner of this booking can reject
+        if (payment.owner_user_id !== req.user.id) {
+            await connection.rollback();
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to reject payment for this booking"
+            });
+        }
+
         if (payment.status !== "PAYMENT_PENDING") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Only pending payments can be rejected"
@@ -238,43 +371,99 @@ export const rejectPayment = async (req, res) => {
         }
 
         if (payment.booking_status !== "ACCEPTED") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Booking is not in accepted status"
             });
         }
 
-        await pool.query(
+        await connection.query(
+            "SELECT id FROM bookings WHERE id = ? FOR UPDATE",
+            [payment.booking_id]
+        );
+
+        // Update payment status and initiate refund requirements
+        await connection.query(
             `UPDATE booking_payments
              SET status = 'PAYMENT_REJECTED',
-                 rejection_reason = ?
+                 rejection_reason = ?,
+                 refund_status = 'REFUND_REQUIRED',
+                 refund_required_at = NOW(),
+                 refund_deadline = DATE_ADD(NOW(), INTERVAL 24 HOUR)
              WHERE id = ?`,
             [reason.trim(), paymentId]
         );
 
+        // Update booking status
+        await connection.query(
+            `UPDATE bookings
+             SET status = 'CANCELLED',
+                 cancellation_reason = ?
+             WHERE id = ?`,
+            [`Payment rejected: ${reason.trim()}`, payment.booking_id]
+        );
+
+        // Release equipment if no other active booking
+        const [activeBookings] = await connection.query(
+            `SELECT id FROM bookings
+             WHERE equipment_id = ?
+             AND status IN ('ACCEPTED', 'CONFIRMED', 'IN_PROGRESS')
+             AND id != ?`,
+            [payment.equipment_id, payment.booking_id]
+        );
+
+        if (activeBookings.length === 0) {
+            await connection.query(
+                `UPDATE equipment
+                 SET status = 'AVAILABLE'
+                 WHERE id = ? AND status = 'BOOKED'`,
+                [payment.equipment_id]
+            );
+        }
+
+        await connection.commit();
+
+        // Send SMS to Farmer (Event 8, non-blocking)
+        sendPaymentRejectedSMS({
+            farmerPhone: payment.farmer_phone,
+            farmerName: payment.farmer_name,
+            bookingId: payment.booking_id,
+            amount: payment.amount,
+            reason: reason.trim()
+        }).catch(err => console.error("Payment rejected SMS error:", err));
+
         return res.status(200).json({
             success: true,
-            message: "Payment rejected successfully",
+            message: "Payment rejected successfully. Refund required within 24 hours.",
             data: {
                 paymentId: Number(paymentId),
                 bookingId: payment.booking_id,
                 paymentStatus: "PAYMENT_REJECTED",
+                refundStatus: "REFUND_REQUIRED",
                 reason: reason.trim()
             }
         });
 
     } catch (error) {
+        await connection.rollback();
         console.error("Reject payment error:", error.message || error);
-
         return res.status(500).json({
             success: false,
             message: "Failed to reject payment"
         });
+    } finally {
+        connection.release();
     }
 };
 
-
+/**
+ * Initiates/submits refund details for a rejected payment.
+ * Protected with MySQL transactions and SELECT ... FOR UPDATE row locking.
+ * Access: Authorized OWNER, AREA_ADMIN (in area), SUPER_ADMIN.
+ */
 export const submitRefund = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
         const { paymentId } = req.params;
         const { refund_transaction_id } = req.body;
@@ -286,21 +475,34 @@ export const submitRefund = async (req, res) => {
             });
         }
 
-        const [payments] = await pool.query(
+        await connection.beginTransaction();
+
+        const [payments] = await connection.query(
             `SELECT
-                id,
-                booking_id,
-                amount,
-                status,
-                refund_status,
-                refund_deadline,
-                (refund_deadline > NOW()) AS refund_window_open
-             FROM booking_payments
-             WHERE id = ?`,
+                bp.id,
+                bp.booking_id,
+                bp.amount,
+                bp.status,
+                bp.refund_status,
+                bp.refund_deadline,
+                (bp.refund_deadline > NOW()) AS refund_window_open,
+                o.user_id AS owner_user_id,
+                e.location_id,
+                fu.phone AS farmer_phone,
+                fu.full_name AS farmer_name
+             FROM booking_payments bp
+             JOIN bookings b ON bp.booking_id = b.id
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN owners o ON e.owner_id = o.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
+             WHERE bp.id = ?
+             FOR UPDATE`,
             [paymentId]
         );
 
         if (payments.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 success: false,
                 message: "Payment not found"
@@ -308,42 +510,78 @@ export const submitRefund = async (req, res) => {
         }
 
         const payment = payments[0];
+        const user = req.user;
 
-        if (payment.status !== "PAYMENT_REJECTED") {
+        // Role-based Access Control
+        if (user.role === "OWNER") {
+            if (payment.owner_user_id !== user.id) {
+                await connection.rollback();
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to submit refund for this payment"
+                });
+            }
+            if (!payment.refund_window_open) {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    message: "Refund deadline has expired. Area Admin will handle the refund."
+                });
+            }
+        } else if (user.role === "AREA_ADMIN") {
+            if (!user.location_id || payment.location_id !== user.location_id) {
+                await connection.rollback();
+                return res.status(403).json({
+                    success: false,
+                    message: "Area Admin can only manage refunds within their assigned area"
+                });
+            }
+        } else if (user.role !== "SUPER_ADMIN") {
+            await connection.rollback();
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to perform this action"
+            });
+        }
+
+        if (payment.status !== "PAYMENT_REJECTED" && payment.refund_status !== "REFUND_REQUIRED") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
-                message: "Refund can only be submitted for a rejected payment"
+                message: "Refund can only be submitted for a rejected payment requiring refund"
+            });
+        }
+
+        if (payment.refund_status === "REFUND_SUBMITTED") {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Refund has already been submitted and is awaiting farmer confirmation"
+            });
+        }
+
+        if (payment.refund_status === "REFUNDED") {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Refund has already been completed"
             });
         }
 
         if (payment.refund_status !== "REFUND_REQUIRED") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Refund is not currently required"
             });
         }
 
-        if (!payment.refund_deadline) {
-            return res.status(400).json({
-                success: false,
-                message: "Refund deadline is not available"
-            });
-        }
-
-        if (!payment.refund_window_open) {
-            return res.status(400).json({
-                success: false,
-                message: "Refund deadline has expired. Area Admin will handle the refund."
-            });
-        }
-
-        await pool.query(
+        await connection.query(
             `UPDATE booking_payments
              SET refund_status = 'REFUND_SUBMITTED',
                  refund_transaction_id = ?,
                  refund_submitted_at = NOW(),
-                 farmer_refund_response_deadline =
-                     DATE_ADD(NOW(), INTERVAL 6 HOUR)
+                 farmer_refund_response_deadline = DATE_ADD(NOW(), INTERVAL 24 HOUR)
              WHERE id = ?`,
             [
                 refund_transaction_id.trim(),
@@ -351,7 +589,7 @@ export const submitRefund = async (req, res) => {
             ]
         );
 
-        const [updatedPayment] = await pool.query(
+        const [updatedRows] = await connection.query(
             `SELECT
                 id,
                 booking_id,
@@ -365,54 +603,84 @@ export const submitRefund = async (req, res) => {
             [paymentId]
         );
 
+        await connection.commit();
+
+        // Send SMS to Farmer (Event 9, non-blocking)
+        sendRefundInitiatedSMS({
+            farmerPhone: payment.farmer_phone,
+            farmerName: payment.farmer_name,
+            bookingId: payment.booking_id,
+            amount: payment.amount,
+            refundTransactionId: refund_transaction_id.trim()
+        }).catch(err => console.error("Refund initiated SMS error:", err));
+
+        const updatedPayment = updatedRows[0];
+
         return res.status(200).json({
             success: true,
-            message: "Refund submitted successfully. Farmer has 6 hours to confirm receipt.",
+            message: "Refund submitted successfully. Farmer has 24 hours to confirm receipt.",
             data: {
                 paymentId: Number(paymentId),
-                bookingId: updatedPayment[0].booking_id,
-                refundAmount: Number(updatedPayment[0].amount),
-                refundTransactionId: updatedPayment[0].refund_transaction_id,
-                refundSubmittedAt: updatedPayment[0].refund_submitted_at,
-                farmerResponseDeadline:
-                    updatedPayment[0].farmer_refund_response_deadline,
-                refundStatus: updatedPayment[0].refund_status
+                bookingId: updatedPayment.booking_id,
+                refundAmount: Number(updatedPayment.amount),
+                refundTransactionId: updatedPayment.refund_transaction_id,
+                refundSubmittedAt: updatedPayment.refund_submitted_at,
+                farmerResponseDeadline: updatedPayment.farmer_refund_response_deadline,
+                refundStatus: updatedPayment.refund_status
             }
         });
 
     } catch (error) {
-        console.error(
-            "Submit refund error:",
-            error.message || error
-        );
-
+        await connection.rollback();
+        console.error("Submit refund error:", error.message || error);
         return res.status(500).json({
             success: false,
             message: "Failed to submit refund"
         });
+    } finally {
+        connection.release();
     }
 };
 
-
+/**
+ * Farmer confirms receipt of refund.
+ * Protected with MySQL transactions and row locking.
+ * Access: Authenticated FARMER associated with the booking.
+ */
 export const confirmRefund = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
         const { paymentId } = req.params;
 
-        const [payments] = await pool.query(
+        await connection.beginTransaction();
+
+        const [payments] = await connection.query(
             `SELECT
-                id,
-                booking_id,
-                amount,
-                refund_status,
-                refund_submitted_at,
-                farmer_refund_response_deadline,
-                farmer_refund_followup_required_at
-             FROM booking_payments
-             WHERE id = ?`,
+                bp.id,
+                bp.booking_id,
+                bp.amount,
+                bp.refund_status,
+                bp.refund_submitted_at,
+                bp.farmer_refund_response_deadline,
+                f.user_id AS farmer_user_id,
+                fu.phone AS farmer_phone,
+                fu.full_name AS farmer_name,
+                ou.phone AS owner_phone,
+                ou.full_name AS owner_name
+             FROM booking_payments bp
+             JOIN bookings b ON bp.booking_id = b.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN owners o ON e.owner_id = o.id
+             JOIN users ou ON o.user_id = ou.id
+             WHERE bp.id = ?
+             FOR UPDATE`,
             [paymentId]
         );
 
         if (payments.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 success: false,
                 message: "Payment not found"
@@ -421,25 +689,63 @@ export const confirmRefund = async (req, res) => {
 
         const payment = payments[0];
 
+        // Authorization check: Only associated farmer can confirm refund
+        if (payment.farmer_user_id !== req.user.id) {
+            await connection.rollback();
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to confirm refund for this booking"
+            });
+        }
+
+        // Prevent confirming a refund before it has been initiated
+        if (payment.refund_status === "NOT_REQUIRED" || payment.refund_status === "REFUND_REQUIRED") {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Refund has not been initiated by the owner"
+            });
+        }
+
+        // Prevent confirming the same refund multiple times
+        if (payment.refund_status === "REFUNDED") {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Refund has already been confirmed"
+            });
+        }
+
+        if (payment.refund_status === "REFUND_DISPUTED") {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Refund is currently under dispute and cannot be directly confirmed"
+            });
+        }
+
         if (payment.refund_status !== "REFUND_SUBMITTED") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Refund is not awaiting farmer confirmation"
             });
         }
 
-       if (
+        // Correct deadline comparison: If current time is past the response deadline,
+        // the farmer can no longer confirm directly as it has escalated to Area Admin.
+        if (
             payment.farmer_refund_response_deadline &&
-            new Date() > new Date(payment.farmer_refund_response_deadline) &&
-            !payment.farmer_refund_followup_required_at
+            new Date() > new Date(payment.farmer_refund_response_deadline)
         ) {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
-                message: "Refund follow-up is not yet required"
+                message: "Refund confirmation deadline has expired. This case has been escalated to Area Admin."
             });
         }
 
-        await pool.query(
+        await connection.query(
             `UPDATE booking_payments
              SET refund_status = 'REFUNDED',
                  refund_verified_at = NOW()
@@ -447,7 +753,7 @@ export const confirmRefund = async (req, res) => {
             [paymentId]
         );
 
-        const [updatedPayment] = await pool.query(
+        const [updatedRows] = await connection.query(
             `SELECT
                 id,
                 booking_id,
@@ -460,33 +766,42 @@ export const confirmRefund = async (req, res) => {
             [paymentId]
         );
 
+        await connection.commit();
+
+        const updatedPayment = updatedRows[0];
+
         return res.status(200).json({
             success: true,
             message: "Refund confirmed successfully",
             data: {
                 paymentId: Number(paymentId),
-                bookingId: updatedPayment[0].booking_id,
-                refundAmount: Number(updatedPayment[0].amount),
-                refundStatus: updatedPayment[0].refund_status,
-                refundSubmittedAt: updatedPayment[0].refund_submitted_at,
-                refundVerifiedAt: updatedPayment[0].refund_verified_at
+                bookingId: updatedPayment.booking_id,
+                refundAmount: Number(updatedPayment.amount),
+                refundStatus: updatedPayment.refund_status,
+                refundSubmittedAt: updatedPayment.refund_submitted_at,
+                refundVerifiedAt: updatedPayment.refund_verified_at
             }
         });
 
     } catch (error) {
-        console.error(
-            "Confirm refund error:",
-            error.message || error
-        );
-
+        await connection.rollback();
+        console.error("Confirm refund error:", error.message || error);
         return res.status(500).json({
             success: false,
             message: "Failed to confirm refund"
         });
+    } finally {
+        connection.release();
     }
 };
 
+/**
+ * Farmer disputes a submitted refund (money not received).
+ * Protected with MySQL transactions and row locking.
+ * Access: Authenticated FARMER associated with the booking.
+ */
 export const disputeRefund = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
         const { paymentId } = req.params;
         const { reason } = req.body;
@@ -498,19 +813,35 @@ export const disputeRefund = async (req, res) => {
             });
         }
 
-        const [payments] = await pool.query(
+        await connection.beginTransaction();
+
+        const [payments] = await connection.query(
             `SELECT
-                id,
-                booking_id,
-                amount,
-                refund_status,
-                refund_submitted_at
-             FROM booking_payments
-             WHERE id = ?`,
+                bp.id,
+                bp.booking_id,
+                bp.amount,
+                bp.refund_status,
+                bp.refund_submitted_at,
+                f.user_id AS farmer_user_id,
+                e.location_id,
+                ou.phone AS owner_phone,
+                ou.full_name AS owner_name,
+                fu.phone AS farmer_phone,
+                fu.full_name AS farmer_name
+             FROM booking_payments bp
+             JOIN bookings b ON bp.booking_id = b.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN owners o ON e.owner_id = o.id
+             JOIN users ou ON o.user_id = ou.id
+             WHERE bp.id = ?
+             FOR UPDATE`,
             [paymentId]
         );
 
         if (payments.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 success: false,
                 message: "Payment not found"
@@ -519,48 +850,118 @@ export const disputeRefund = async (req, res) => {
 
         const payment = payments[0];
 
-        if (payment.refund_status !== "REFUND_SUBMITTED") {
+        // Authorization check: Only associated farmer can raise dispute
+        if (payment.farmer_user_id !== req.user.id) {
+            await connection.rollback();
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to dispute refund for this booking"
+            });
+        }
+
+        if (payment.refund_status === "REFUNDED") {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Cannot dispute an already confirmed refund"
+            });
+        }
+
+        if (payment.refund_status === "REFUND_DISPUTED") {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Refund dispute has already been submitted for this payment"
+            });
+        }
+
+        if (payment.refund_status !== "REFUND_SUBMITTED" && payment.refund_status !== "REFUND_OUTSTANDING") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Refund is not available for dispute"
             });
         }
 
-  
-            await pool.query(
-                `UPDATE booking_payments
-                SET refund_status = 'REFUND_DISPUTED',
-                    refund_dispute_reason = ?
-                WHERE id = ?`,
-                [reason.trim(), paymentId]
+        // Update payment status
+        await connection.query(
+            `UPDATE booking_payments
+             SET refund_status = 'REFUND_DISPUTED',
+                 refund_dispute_reason = ?
+             WHERE id = ?`,
+            [reason.trim(), paymentId]
+        );
+
+        // Find assigned Area Admin for the booking/equipment location
+        const [adminRows] = await connection.query(
+            `SELECT aa.id, aa.user_id, u.phone AS admin_phone, u.full_name AS admin_name
+             FROM area_admins aa
+             JOIN users u ON aa.user_id = u.id
+             WHERE aa.location_id = ?
+             LIMIT 1`,
+            [payment.location_id]
+        );
+
+        const assignedAreaAdminId = adminRows.length > 0 ? adminRows[0].id : null;
+        const adminData = adminRows.length > 0 ? adminRows[0] : null;
+
+        // Prevent duplicate dispute records
+        const [existingDisputes] = await connection.query(
+            `SELECT id FROM refund_disputes WHERE payment_id = ? FOR UPDATE`,
+            [paymentId]
+        );
+
+        let disputeId;
+        if (existingDisputes.length === 0) {
+            const [disputeResult] = await connection.query(
+                `INSERT INTO refund_disputes
+                    (payment_id, booking_id, dispute_reason, dispute_category, raised_by_user_id, raised_by_role, status, assigned_area_admin_id)
+                 VALUES (?, ?, ?, 'REFUND_NOT_RECEIVED', ?, 'FARMER', 'OPEN', ?)`,
+                [
+                    paymentId,
+                    payment.booking_id,
+                    reason.trim(),
+                    req.user.id,
+                    assignedAreaAdminId
+                ]
             );
+            disputeId = disputeResult.insertId;
+        } else {
+            disputeId = existingDisputes[0].id;
+        }
 
-     
-                const [existingDisputes] = await pool.query(
-                    `SELECT id
-                    FROM refund_disputes
-                    WHERE payment_id = ?`,
-                    [paymentId]
-                );
+        await connection.commit();
 
-                if (existingDisputes.length === 0) {
-                    await pool.query(
-                        `INSERT INTO refund_disputes
-                            (payment_id, booking_id, dispute_reason, status)
-                        VALUES (?, ?, ?, 'OPEN')`,
-                        [
-                            paymentId,
-                            payment.booking_id,
-                            reason.trim()
-                        ]
-                    );
-                }
+        // Send notifications (Event 11 & 12, non-blocking)
+        sendRefundDisputeSMS({
+            recipientPhone: payment.farmer_phone,
+            recipientName: payment.farmer_name,
+            bookingId: payment.booking_id,
+            disputeReason: reason.trim()
+        }).catch(err => console.error("Dispute farmer SMS error:", err));
 
-                
+        sendRefundDisputeSMS({
+            recipientPhone: payment.owner_phone,
+            recipientName: payment.owner_name,
+            bookingId: payment.booking_id,
+            disputeReason: reason.trim()
+        }).catch(err => console.error("Dispute owner SMS error:", err));
+
+        if (adminData && adminData.admin_phone) {
+            sendAreaAdminDisputeSMS({
+                adminPhone: adminData.admin_phone,
+                adminName: adminData.admin_name,
+                bookingId: payment.booking_id,
+                disputeId,
+                disputeReason: reason.trim()
+            }).catch(err => console.error("Dispute area admin SMS error:", err));
+        }
+
         return res.status(200).json({
             success: true,
             message: "Refund dispute submitted successfully",
             data: {
+                disputeId,
                 paymentId: Number(paymentId),
                 bookingId: payment.booking_id,
                 refundAmount: Number(payment.amount),
@@ -571,14 +972,13 @@ export const disputeRefund = async (req, res) => {
         });
 
     } catch (error) {
-        console.error(
-            "Dispute refund error:",
-            error.message || error
-        );
-
+        await connection.rollback();
+        console.error("Dispute refund error:", error.message || error);
         return res.status(500).json({
             success: false,
             message: "Failed to submit refund dispute"
         });
+    } finally {
+        connection.release();
     }
 };

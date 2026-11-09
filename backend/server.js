@@ -8,10 +8,14 @@ import equipmentCategoryRoutes from "./routes/equipmentCategoryRoutes.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
+import inspectionRoutes from "./routes/inspectionRoutes.js";
 import { 
     checkPaymentVerificationTimeouts, 
     checkBookingAcceptanceTimeouts 
 } from "./services/paymentTimeoutService.js";
+import {
+    checkInspectionMediaCleanupTimeouts
+} from "./services/mediaCleanupService.js";
 
 const app = express();
 
@@ -25,6 +29,7 @@ app.use("/api", equipmentCategoryRoutes);
 app.use("/api", bookingRoutes);
 app.use("/api", paymentRoutes);
 app.use("/api", adminRoutes);
+app.use("/api", inspectionRoutes);
 
 app.get("/", (req, res) => {
   res.json({
@@ -56,6 +61,7 @@ const PORT = process.env.PORT || 5000;
 const runTimeoutChecks = async () => {
     await checkPaymentVerificationTimeouts();
     await checkBookingAcceptanceTimeouts();
+    await checkInspectionMediaCleanupTimeouts();
 };
 
 setInterval(runTimeoutChecks, 60 * 1000);

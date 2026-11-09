@@ -1,5 +1,9 @@
 import pool from "../db.js";
 
+/**
+ * Updates equipment status (e.g., AVAILABLE, BOOKED, MAINTENANCE, UNDER_INSPECTION).
+ * Access: OWNER (for their own equipment), AREA_ADMIN (in assigned area), SUPER_ADMIN.
+ */
 export const updateEquipmentStatus = async (req, res) => {
     try {
         const { equipmentId } = req.params;
@@ -22,7 +26,7 @@ export const updateEquipmentStatus = async (req, res) => {
         }
 
         const [equipment] = await pool.query(
-            "SELECT id FROM equipment WHERE id = ?",
+            "SELECT id, owner_id, location_id FROM equipment WHERE id = ?",
             [equipmentId]
         );
 
@@ -30,6 +34,32 @@ export const updateEquipmentStatus = async (req, res) => {
             return res.status(404).json({
                 success: false,
                 message: "Equipment not found"
+            });
+        }
+
+        const eq = equipment[0];
+        const user = req.user;
+
+        // Role-based authorization & IDOR protection
+        if (user.role === "OWNER") {
+            const ownerId = user.owner_id;
+            if (!ownerId || eq.owner_id !== ownerId) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to update status of equipment you do not own"
+                });
+            }
+        } else if (user.role === "AREA_ADMIN") {
+            if (!user.location_id || eq.location_id !== user.location_id) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Area Admin can only manage equipment within their assigned area"
+                });
+            }
+        } else if (user.role !== "SUPER_ADMIN") {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to perform this action"
             });
         }
 
@@ -62,6 +92,9 @@ export const updateEquipmentStatus = async (req, res) => {
     }
 };
 
+/**
+ * Public route to get equipment details by ID.
+ */
 export const getEquipmentById = async (req, res) => {
     try {
         const { equipmentId } = req.params;
@@ -113,6 +146,9 @@ export const getEquipmentById = async (req, res) => {
     }
 };
 
+/**
+ * Public route to list all verified available equipment.
+ */
 export const getAvailableEquipment = async (req, res) => {
     try {
         const [equipment] = await pool.query(
@@ -153,10 +189,15 @@ export const getAvailableEquipment = async (req, res) => {
     }
 };
 
+/**
+ * Updates equipment verification status (VERIFIED or REJECTED).
+ * Access: AREA_ADMIN (in assigned area only), SUPER_ADMIN.
+ * verified_by is taken strictly from authenticated user (req.user.id).
+ */
 export const updateEquipmentVerification = async (req, res) => {
     try {
         const { equipmentId } = req.params;
-        const { verification_status, verified_by } = req.body;
+        const { verification_status } = req.body;
 
         const allowedStatuses = [
             "VERIFIED",
@@ -171,7 +212,7 @@ export const updateEquipmentVerification = async (req, res) => {
         }
 
         const [equipment] = await pool.query(
-            "SELECT id FROM equipment WHERE id = ?",
+            "SELECT id, location_id FROM equipment WHERE id = ?",
             [equipmentId]
         );
 
@@ -182,35 +223,42 @@ export const updateEquipmentVerification = async (req, res) => {
             });
         }
 
-        if (!verified_by) {
-            return res.status(400).json({
+        const eq = equipment[0];
+        const user = req.user;
+
+        // Area Admin scope validation
+        if (user.role === "AREA_ADMIN") {
+            if (!user.location_id || eq.location_id !== user.location_id) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Area Admin can only manage equipment within their assigned area"
+                });
+            }
+        } else if (user.role !== "SUPER_ADMIN") {
+            return res.status(403).json({
                 success: false,
-                message: "verified_by is required"
+                message: "You are not authorized to perform this action"
             });
         }
 
-        const [user] = await pool.query(
-            "SELECT id FROM users WHERE id = ?",
-            [verified_by]
-        );
+        // Never trust verified_by from req.body; strictly use authenticated user's ID
+        const verifiedBy = user.id;
 
-        if (user.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: "Verifier user not found"
-            });
-        }
+        // If verified, set status to AVAILABLE; if rejected, keep UNDER_INSPECTION
+        const newStatus = verification_status === "VERIFIED" ? "AVAILABLE" : "UNDER_INSPECTION";
 
         await pool.query(
             `UPDATE equipment
              SET
                 verification_status = ?,
+                status = ?,
                 verified_by = ?,
                 verified_at = CURRENT_TIMESTAMP
              WHERE id = ?`,
             [
                 verification_status,
-                verified_by,
+                newStatus,
+                verifiedBy,
                 equipmentId
             ]
         );
@@ -221,7 +269,8 @@ export const updateEquipmentVerification = async (req, res) => {
             data: {
                 equipmentId: Number(equipmentId),
                 verificationStatus: verification_status,
-                verifiedBy: Number(verified_by)
+                status: newStatus,
+                verifiedBy: Number(verifiedBy)
             }
         });
 
@@ -238,10 +287,14 @@ export const updateEquipmentVerification = async (req, res) => {
     }
 };
 
+/**
+ * Creates new equipment.
+ * Access: Authenticated OWNER only.
+ * owner_id is taken strictly from authenticated owner profile (req.user.owner_id).
+ */
 export const createEquipment = async (req, res) => {
     try {
         const {
-            owner_id,
             location_id,
             name,
             category_id,
@@ -251,32 +304,34 @@ export const createEquipment = async (req, res) => {
             price_per_day
         } = req.body;
 
-        if (    !owner_id ||
-                !location_id ||
-                !name ||
-                 !category_id
-            ) {
-            return res.status(400).json({
-                success: false,
-                message: "owner_id, location_id, name and equipment_type are required"
-            });
+        // Strictly resolve owner_id from authenticated session
+        let effectiveOwnerId = req.user.owner_id;
+        if (!effectiveOwnerId) {
+            const [ownerRows] = await pool.query(
+                "SELECT id, location_id FROM owners WHERE user_id = ?",
+                [req.user.id]
+            );
+            if (ownerRows.length === 0) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Owner profile not found for authenticated user"
+                });
+            }
+            effectiveOwnerId = ownerRows[0].id;
         }
 
-        const [owner] = await pool.query(
-            "SELECT id FROM owners WHERE id = ?",
-            [owner_id]
-        );
+        const effectiveLocationId = location_id || req.user.location_id;
 
-        if (owner.length === 0) {
-            return res.status(404).json({
+        if (!effectiveLocationId || !name || !category_id) {
+            return res.status(400).json({
                 success: false,
-                message: "Owner not found"
+                message: "location_id, name and category_id are required"
             });
         }
 
         const [location] = await pool.query(
             "SELECT id FROM locations WHERE id = ?",
-            [location_id]
+            [effectiveLocationId]
         );
 
         if (location.length === 0) {
@@ -286,16 +341,16 @@ export const createEquipment = async (req, res) => {
             });
         }
 
-         const [category] = await pool.query(
-                "SELECT id FROM equipment_categories WHERE id = ? AND status = 'ACTIVE'",
-                [category_id]
-            );
+        const [category] = await pool.query(
+            "SELECT id FROM equipment_categories WHERE id = ? AND status = 'ACTIVE'",
+            [category_id]
+        );
 
         if (category.length === 0) {
-                return res.status(404).json({
-                    success: false,
-                    message: "Equipment category not found or inactive"
-                });
+            return res.status(404).json({
+                success: false,
+                message: "Equipment category not found or inactive"
+            });
         }
 
         const [result] = await pool.query(
@@ -313,8 +368,8 @@ export const createEquipment = async (req, res) => {
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'UNDER_INSPECTION', 'PENDING')`,
             [
-                owner_id,
-                location_id,
+                effectiveOwnerId,
+                effectiveLocationId,
                 name,
                 category_id,
                 equipment_type || null,
@@ -329,8 +384,8 @@ export const createEquipment = async (req, res) => {
             message: "Equipment created successfully",
             data: {
                 equipmentId: result.insertId,
-                ownerId: Number(owner_id),
-                locationId: Number(location_id),
+                ownerId: Number(effectiveOwnerId),
+                locationId: Number(effectiveLocationId),
                 name,
                 equipmentType: equipment_type,
                 status: "UNDER_INSPECTION",
@@ -351,7 +406,10 @@ export const createEquipment = async (req, res) => {
     }
 };
 
-
+/**
+ * Updates equipment details.
+ * Access: Authenticated equipment owner only.
+ */
 export const updateEquipment = async (req, res) => {
     try {
         const { equipmentId } = req.params;
@@ -366,7 +424,7 @@ export const updateEquipment = async (req, res) => {
         } = req.body;
 
         const [equipment] = await pool.query(
-            "SELECT id FROM equipment WHERE id = ?",
+            "SELECT id, owner_id FROM equipment WHERE id = ?",
             [equipmentId]
         );
 
@@ -374,6 +432,17 @@ export const updateEquipment = async (req, res) => {
             return res.status(404).json({
                 success: false,
                 message: "Equipment not found"
+            });
+        }
+
+        const eq = equipment[0];
+
+        // Owner verification
+        const ownerId = req.user.owner_id;
+        if (!ownerId || eq.owner_id !== ownerId) {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to update equipment you do not own"
             });
         }
 
@@ -487,12 +556,16 @@ export const updateEquipment = async (req, res) => {
     }
 };
 
+/**
+ * Deletes equipment.
+ * Access: Authenticated equipment owner only.
+ */
 export const deleteEquipment = async (req, res) => {
     try {
         const { equipmentId } = req.params;
 
         const [equipment] = await pool.query(
-            `SELECT id
+            `SELECT id, owner_id
              FROM equipment
              WHERE id = ?`,
             [equipmentId]
@@ -502,6 +575,32 @@ export const deleteEquipment = async (req, res) => {
             return res.status(404).json({
                 success: false,
                 message: "Equipment not found"
+            });
+        }
+
+        const eq = equipment[0];
+
+        // Owner verification
+        const ownerId = req.user.owner_id;
+        if (!ownerId || eq.owner_id !== ownerId) {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to delete equipment you do not own"
+            });
+        }
+
+        // Prevent deletion if there are active bookings
+        const [activeBookings] = await pool.query(
+            `SELECT id FROM bookings
+             WHERE equipment_id = ?
+             AND status IN ('PENDING', 'ACCEPTED', 'CONFIRMED', 'IN_PROGRESS')`,
+            [equipmentId]
+        );
+
+        if (activeBookings.length > 0) {
+            return res.status(400).json({
+                success: false,
+                message: "Cannot delete equipment with active or pending bookings"
             });
         }
 
@@ -532,6 +631,9 @@ export const deleteEquipment = async (req, res) => {
     }
 };
 
+/**
+ * Public search for verified available equipment.
+ */
 export const searchEquipment = async (req, res) => {
     try {
        const {
@@ -620,22 +722,50 @@ export const searchEquipment = async (req, res) => {
     }
 };
 
-
+/**
+ * Gets equipment belonging to a specific owner.
+ * Access: Owner (for their own equipment), Area Admin (within assigned area), Super Admin.
+ */
 export const getEquipmentByOwner = async (req, res) => {
     try {
         const { ownerId } = req.params;
 
-        const [owner] = await pool.query(
-            `SELECT id
+        const [ownerRows] = await pool.query(
+            `SELECT id, user_id, location_id
              FROM owners
              WHERE id = ?`,
             [ownerId]
         );
 
-        if (owner.length === 0) {
+        if (ownerRows.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: "Owner not found"
+            });
+        }
+
+        const owner = ownerRows[0];
+        const user = req.user;
+
+        // Role-based Access and Ownership Check
+        if (user.role === "OWNER") {
+            if (owner.user_id !== user.id) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to view another owner's equipment"
+                });
+            }
+        } else if (user.role === "AREA_ADMIN") {
+            if (!user.location_id || (owner.location_id && owner.location_id !== user.location_id)) {
+                return res.status(403).json({
+                    success: false,
+                    message: "Area Admin cannot view equipment for owners outside their assigned area"
+                });
+            }
+        } else if (user.role !== "SUPER_ADMIN") {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to perform this action"
             });
         }
 
