@@ -2,10 +2,11 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pool from "../db.js";
 import {
-    sendOTPSMS,
-    sendPasswordResetOTPSMS,
-    sendPasswordResetSuccessSMS
-} from "../services/smsService.js";
+    sendOTPEmail,
+    sendPasswordResetOTPEmail,
+    sendPasswordResetSuccessEmail
+} from "../services/notificationService.js";
+import { isValidEmail } from "../services/emailService.js";
 
 const PHONE_REGEX = /^[6-9]\d{9}$/;
 
@@ -19,10 +20,10 @@ export const register = async (req, res) => {
         const { full_name, phone, email, password, role, location_id, address } = req.body;
 
         // 1. Input validations
-        if (!full_name || !phone || !password || !role) {
+        if (!full_name || !phone || !email || !password || !role) {
             return res.status(400).json({
                 success: false,
-                message: "Full name, phone, password, and role are required"
+                message: "Full name, phone, email, password, and role are required"
             });
         }
 
@@ -31,6 +32,14 @@ export const register = async (req, res) => {
             return res.status(400).json({
                 success: false,
                 message: "Please enter a valid 10-digit Indian mobile number"
+            });
+        }
+
+        const trimmedEmail = email.trim().toLowerCase();
+        if (!isValidEmail(trimmedEmail)) {
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a valid email address"
             });
         }
 
@@ -52,8 +61,8 @@ export const register = async (req, res) => {
 
         // 2. Check duplicate phone or email
         const [existingUsers] = await connection.query(
-            "SELECT id, phone, email FROM users WHERE phone = ? OR (email IS NOT NULL AND email = ?)",
-            [trimmedPhone, email ? email.trim() : ""]
+            "SELECT id, phone, email FROM users WHERE phone = ? OR email = ?",
+            [trimmedPhone, trimmedEmail]
         );
 
         if (existingUsers.length > 0) {
@@ -73,7 +82,7 @@ export const register = async (req, res) => {
         const [userResult] = await connection.query(
             `INSERT INTO users (full_name, phone, email, password_hash, role, status)
              VALUES (?, ?, ?, ?, ?, 'PENDING')`,
-            [full_name.trim(), trimmedPhone, email ? email.trim() : null, passwordHash, upperRole]
+            [full_name.trim(), trimmedPhone, trimmedEmail, passwordHash, upperRole]
         );
         const userId = userResult.insertId;
 
@@ -98,22 +107,25 @@ export const register = async (req, res) => {
 
         // Store OTP with 5-minute expiry
         await connection.query(
-            `INSERT INTO user_otps (phone, otp_hash, expires_at)
-             VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
-            [trimmedPhone, otpHash]
+            `INSERT INTO user_otps (phone, email, purpose, otp_hash, expires_at)
+             VALUES (?, ?, 'REGISTRATION', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+            [trimmedPhone, trimmedEmail, otpHash]
         );
 
         await connection.commit();
 
-        // 7. Send OTP via SMS
-        sendOTPSMS({ phone: trimmedPhone, otp }).catch(err => console.error("Register OTP SMS error:", err));
+        // 7. Send OTP via Brevo Email
+        sendOTPEmail({ email: trimmedEmail, name: full_name.trim(), otp }).catch(err =>
+            console.error("Register OTP Email error:", err)
+        );
 
         return res.status(201).json({
             success: true,
-            message: "Registration initiated successfully. Please verify the OTP sent to your mobile.",
+            message: "Registration initiated successfully. Please verify the OTP sent to your email.",
             data: {
                 userId,
                 phone: trimmedPhone,
+                email: trimmedEmail,
                 role: upperRole,
                 status: "PENDING",
                 // Exposed for test verification in non-production
@@ -134,28 +146,37 @@ export const register = async (req, res) => {
 };
 
 /**
- * Dispatch Mobile OTP for login or registration verification
+ * Dispatch OTP for login or registration verification
  * Route: POST /api/auth/otp/send
  */
 export const sendOTP = async (req, res) => {
     try {
-        const { phone } = req.body;
+        const { phone, email, identifier } = req.body;
+        const target = (identifier || email || phone || "").trim();
 
-        if (!phone || !PHONE_REGEX.test(phone.trim())) {
+        if (!target) {
             return res.status(400).json({
                 success: false,
-                message: "Please enter a valid 10-digit mobile number"
+                message: "Please enter a valid mobile number or email address"
             });
         }
 
-        const trimmedPhone = phone.trim();
+        const isPhone = PHONE_REGEX.test(target);
+        const isEmail = isValidEmail(target);
+
+        if (!isPhone && !isEmail) {
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a valid 10-digit mobile number or email address"
+            });
+        }
 
         // Rate limit: check if an unexpired OTP was sent within the last 60 seconds
         const [recentOtps] = await pool.query(
             `SELECT id FROM user_otps
-             WHERE phone = ? AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)
+             WHERE (phone = ? OR email = ?) AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)
              LIMIT 1`,
-            [trimmedPhone]
+            [target, target]
         );
 
         if (recentOtps.length > 0) {
@@ -165,22 +186,39 @@ export const sendOTP = async (req, res) => {
             });
         }
 
+        // Fetch user info if registered
+        const [users] = await pool.query(
+            "SELECT id, full_name, phone, email FROM users WHERE phone = ? OR email = ?",
+            [target, target]
+        );
+
+        const targetEmail = users.length > 0 ? users[0].email : (isEmail ? target : null);
+        const targetPhone = users.length > 0 ? users[0].phone : (isPhone ? target : null);
+        const targetName = users.length > 0 ? users[0].full_name : "AgriRent User";
+
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
         const otpHash = await bcrypt.hash(otp, 8);
 
         await pool.query(
-            `INSERT INTO user_otps (phone, otp_hash, expires_at)
-             VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
-            [trimmedPhone, otpHash]
+            `INSERT INTO user_otps (phone, email, purpose, otp_hash, expires_at)
+             VALUES (?, ?, 'REGISTRATION', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+            [targetPhone, targetEmail, otpHash]
         );
 
-        sendOTPSMS({ phone: trimmedPhone, otp }).catch(err => console.error("Send OTP SMS error:", err));
+        if (targetEmail) {
+            sendOTPEmail({ email: targetEmail, name: targetName, otp }).catch(err =>
+                console.error("Send OTP Email error:", err)
+            );
+        }
 
         return res.status(200).json({
             success: true,
-            message: `OTP sent successfully to ${trimmedPhone}`,
+            message: targetEmail
+                ? `OTP sent successfully to registered email ${targetEmail}`
+                : `OTP generated successfully`,
             data: {
-                phone: trimmedPhone,
+                phone: targetPhone,
+                email: targetEmail,
                 otp: process.env.NODE_ENV === "production" ? undefined : otp
             }
         });
@@ -195,31 +233,31 @@ export const sendOTP = async (req, res) => {
 };
 
 /**
- * Verify Mobile OTP and activate account or authenticate
+ * Verify OTP and activate account or authenticate
  * Route: POST /api/auth/otp/verify
  */
 export const verifyOTP = async (req, res) => {
     try {
-        const { phone, otp } = req.body;
+        const { phone, email, identifier, otp } = req.body;
+        const target = (identifier || email || phone || "").trim();
 
-        if (!phone || !otp) {
+        if (!target || !otp) {
             return res.status(400).json({
                 success: false,
-                message: "Phone number and OTP are required"
+                message: "Identifier (mobile/email) and OTP are required"
             });
         }
 
-        const trimmedPhone = phone.trim();
         const trimmedOtp = otp.trim();
 
-        // 1. Fetch latest active unverified OTP for this phone
+        // 1. Fetch latest active unverified OTP for this phone or email
         const [otpRows] = await pool.query(
             `SELECT id, otp_hash, expires_at, attempts
              FROM user_otps
-             WHERE phone = ? AND is_verified = FALSE AND expires_at > NOW()
+             WHERE (phone = ? OR email = ?) AND is_verified = FALSE AND expires_at > NOW()
              ORDER BY created_at DESC
              LIMIT 1`,
-            [trimmedPhone]
+            [target, target]
         );
 
         if (otpRows.length === 0) {
@@ -260,20 +298,20 @@ export const verifyOTP = async (req, res) => {
 
         // 5. Activate user if currently PENDING
         await pool.query(
-            "UPDATE users SET status = 'ACTIVE' WHERE phone = ? AND status = 'PENDING'",
-            [trimmedPhone]
+            "UPDATE users SET status = 'ACTIVE' WHERE (phone = ? OR email = ?) AND status = 'PENDING'",
+            [target, target]
         );
 
         // 6. Fetch user profile
         const [users] = await pool.query(
-            "SELECT id, full_name, phone, email, role, status FROM users WHERE phone = ?",
-            [trimmedPhone]
+            "SELECT id, full_name, phone, email, role, status FROM users WHERE phone = ? OR email = ?",
+            [target, target]
         );
 
         if (users.length === 0) {
             return res.status(200).json({
                 success: true,
-                message: "Mobile OTP verified successfully"
+                message: "OTP verified successfully"
             });
         }
 
@@ -455,23 +493,32 @@ export const getCurrentUser = async (req, res) => {
  */
 export const requestPasswordResetOTP = async (req, res) => {
     try {
-        const { phone } = req.body;
+        const { phone, email, identifier } = req.body;
+        const target = (identifier || email || phone || "").trim();
 
-        if (!phone || !PHONE_REGEX.test(phone.trim())) {
+        if (!target) {
             return res.status(400).json({
                 success: false,
-                message: "Please enter a valid 10-digit mobile number"
+                message: "Please enter your registered mobile number or email address"
             });
         }
 
-        const trimmedPhone = phone.trim();
+        const isPhone = PHONE_REGEX.test(target);
+        const isEmail = isValidEmail(target);
+
+        if (!isPhone && !isEmail) {
+            return res.status(400).json({
+                success: false,
+                message: "Please enter a valid 10-digit mobile number or email address"
+            });
+        }
 
         // 1. Rate limit: check if an unexpired OTP was sent within the last 60 seconds
         const [recentOtps] = await pool.query(
             `SELECT id FROM user_otps
-             WHERE phone = ? AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)
+             WHERE (phone = ? OR email = ?) AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)
              LIMIT 1`,
-            [trimmedPhone]
+            [target, target]
         );
 
         if (recentOtps.length > 0) {
@@ -483,43 +530,48 @@ export const requestPasswordResetOTP = async (req, res) => {
 
         // 2. Check if user exists (User Enumeration Prevention)
         const [users] = await pool.query(
-            "SELECT id, full_name, status FROM users WHERE phone = ?",
-            [trimmedPhone]
+            "SELECT id, full_name, phone, email, status FROM users WHERE phone = ? OR email = ?",
+            [target, target]
         );
 
         // Even if user does not exist or is blocked, return identical generic response
         if (users.length === 0 || users[0].status === "BLOCKED") {
             return res.status(200).json({
                 success: true,
-                message: "If this mobile number is registered, an OTP has been sent."
+                message: "If this account is registered, a password reset OTP has been sent."
             });
         }
+
+        const user = users[0];
 
         // 3. Generate secure 6-digit OTP
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
         const otpHash = await bcrypt.hash(otp, 8);
 
-        // Invalidate any previous unverified password reset OTPs for this phone
+        // Invalidate any previous unverified password reset OTPs for this user
         await pool.query(
-            "UPDATE user_otps SET is_used = TRUE WHERE phone = ? AND purpose = 'PASSWORD_RESET' AND is_verified = FALSE",
-            [trimmedPhone]
+            "UPDATE user_otps SET is_used = TRUE WHERE (phone = ? OR email = ?) AND purpose = 'PASSWORD_RESET' AND is_verified = FALSE",
+            [user.phone, user.email]
         );
 
         await pool.query(
-            `INSERT INTO user_otps (phone, purpose, otp_hash, expires_at)
-             VALUES (?, 'PASSWORD_RESET', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
-            [trimmedPhone, otpHash]
+            `INSERT INTO user_otps (phone, email, purpose, otp_hash, expires_at)
+             VALUES (?, ?, 'PASSWORD_RESET', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+            [user.phone, user.email, otpHash]
         );
 
-        sendPasswordResetOTPSMS({ phone: trimmedPhone, otp }).catch(err =>
-            console.error("Password reset OTP SMS error:", err)
-        );
+        sendPasswordResetOTPEmail({
+            email: user.email,
+            name: user.full_name,
+            otp
+        }).catch(err => console.error("Password reset OTP Email error:", err));
 
         return res.status(200).json({
             success: true,
-            message: "If this mobile number is registered, an OTP has been sent.",
+            message: "If this account is registered, a password reset OTP has been sent.",
             data: {
-                phone: trimmedPhone,
+                phone: user.phone,
+                email: user.email,
                 otp: process.env.NODE_ENV === "production" ? undefined : otp
             }
         });
@@ -539,26 +591,26 @@ export const requestPasswordResetOTP = async (req, res) => {
  */
 export const verifyPasswordResetOTP = async (req, res) => {
     try {
-        const { phone, otp } = req.body;
+        const { phone, email, identifier, otp } = req.body;
+        const target = (identifier || email || phone || "").trim();
 
-        if (!phone || !otp) {
+        if (!target || !otp) {
             return res.status(400).json({
                 success: false,
-                message: "Phone number and OTP are required"
+                message: "Registered mobile/email and OTP are required"
             });
         }
 
-        const trimmedPhone = phone.trim();
         const trimmedOtp = otp.trim();
 
         // 1. Fetch latest active unverified password reset OTP
         const [otpRows] = await pool.query(
-            `SELECT id, otp_hash, expires_at, attempts
+            `SELECT id, otp_hash, expires_at, attempts, phone, email
              FROM user_otps
-             WHERE phone = ? AND purpose = 'PASSWORD_RESET' AND is_verified = FALSE AND is_used = FALSE AND expires_at > NOW()
+             WHERE (phone = ? OR email = ?) AND purpose = 'PASSWORD_RESET' AND is_verified = FALSE AND is_used = FALSE AND expires_at > NOW()
              ORDER BY created_at DESC
              LIMIT 1`,
-            [trimmedPhone]
+            [target, target]
         );
 
         if (otpRows.length === 0) {
@@ -605,8 +657,8 @@ export const verifyPasswordResetOTP = async (req, res) => {
 
         // 5. Fetch user record
         const [users] = await pool.query(
-            "SELECT id, phone, role FROM users WHERE phone = ?",
-            [trimmedPhone]
+            "SELECT id, phone, email, full_name, role FROM users WHERE phone = ? OR email = ?",
+            [target, target]
         );
 
         if (users.length === 0) {
@@ -624,6 +676,7 @@ export const verifyPasswordResetOTP = async (req, res) => {
             {
                 userId: user.id,
                 phone: user.phone,
+                email: user.email,
                 otpId: otpRecord.id,
                 purpose: "PASSWORD_RESET_AUTH"
             },
@@ -733,7 +786,7 @@ export const resetPassword = async (req, res) => {
 
         // 2. Lock user record
         const [users] = await connection.query(
-            "SELECT id, phone, full_name, status FROM users WHERE id = ? FOR UPDATE",
+            "SELECT id, phone, email, full_name, status FROM users WHERE id = ? FOR UPDATE",
             [decoded.userId]
         );
 
@@ -775,11 +828,11 @@ export const resetPassword = async (req, res) => {
 
         await connection.commit();
 
-        // 6. Send confirmation SMS (non-blocking)
-        sendPasswordResetSuccessSMS({
-            phone: user.phone,
-            userName: user.full_name
-        }).catch(err => console.error("Password reset success SMS error:", err));
+        // 6. Send confirmation Email (non-blocking)
+        sendPasswordResetSuccessEmail({
+            email: user.email,
+            name: user.full_name
+        }).catch(err => console.error("Password reset success email error:", err));
 
         return res.status(200).json({
             success: true,

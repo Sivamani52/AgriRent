@@ -1,0 +1,38 @@
+<div class="greeting">Hello {{recipientName}},</div>
+
+<span class="badge {{badgeClass}}">{{refundTitle}}</span>
+
+<p style="font-size: 15px; line-height: 1.6; color: #334155;">
+  {{refundMessage}}
+</p>
+
+<table class="details-table">
+  <tr>
+    <th>Booking ID</th>
+    <td>#{{bookingId}}</td>
+  </tr>
+  <tr>
+    <th>Refund Amount</th>
+    <td style="color: #16a34a; font-size: 16px;">₹{{refundAmount}}</td>
+  </tr>
+  {{#refundRefRow}}
+  <tr>
+    <th>Refund Reference / UTR</th>
+    <td>{{refundReference}}</td>
+  </tr>
+  {{/refundRefRow}}
+  {{#deadlineRow}}
+  <tr>
+    <th>Confirmation Deadline</th>
+    <td style="color: #f59e0b; font-weight: 700;">{{deadline}}</td>
+  </tr>
+  {{/deadlineRow}}
+</table>
+
+<div class="{{alertBoxClass}}">
+  {{actionGuidance}}
+</div>
+
+<p style="font-size: 13px; color: #64748b; margin-top: 24px;">
+  Thank you for using AgriRent secure transactions.
+</p>

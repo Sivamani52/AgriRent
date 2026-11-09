@@ -1,11 +1,11 @@
 import pool from "../db.js";
 import cloudinary from "../config/cloudinary.js";
 import {
-    sendInspectionSubmittedSMS,
-    sendHandoverCompletedSMS,
-    sendReturnCompletedSMS,
-    sendReturnDamageDisputeSMS
-} from "../services/smsService.js";
+    sendInspectionSubmittedEmail,
+    sendHandoverCompletedEmail,
+    sendReturnCompletedEmail,
+    sendReturnDamageDisputeEmail
+} from "../services/notificationService.js";
 
 /**
  * Uploads a file buffer directly to Cloudinary
@@ -48,9 +48,11 @@ const getAuthorizedBooking = async (bookingId, user) => {
             e.owner_id,
             e.location_id AS equipment_location_id,
             o.user_id AS owner_user_id,
+            ou.email AS owner_email,
             ou.full_name AS owner_name,
             ou.phone AS owner_phone,
             f.user_id AS farmer_user_id,
+            fu.email AS farmer_email,
             fu.full_name AS farmer_name,
             fu.phone AS farmer_phone
          FROM bookings b
@@ -267,16 +269,16 @@ export const submitInitialInspection = async (req, res) => {
             }
         }
 
-        // Notify counterpart via SMS (non-blocking)
-        const recipientPhone = role === "OWNER" ? booking.farmer_phone : booking.owner_phone;
+        // Notify counterpart via Brevo Email (non-blocking)
+        const recipientEmail = role === "OWNER" ? booking.farmer_email : booking.owner_email;
         const recipientName = role === "OWNER" ? booking.farmer_name : booking.owner_name;
-        sendInspectionSubmittedSMS({
-            recipientPhone,
+        sendInspectionSubmittedEmail({
+            recipientEmail,
             recipientName,
             bookingId,
             stage: "INITIAL",
             inspectorRole: role
-        }).catch(err => console.error("Inspection submitted SMS error:", err));
+        }).catch(err => console.error("Inspection submitted email error:", err));
 
         return res.status(200).json({
             success: true,
@@ -444,21 +446,21 @@ export const confirmInitialInspection = async (req, res) => {
 
         await connection.commit();
 
-        // 4. Send Handover notifications if finalized
+        // 4. Send Handover notifications if finalized (via Brevo Email)
         if (handoverFinalized) {
-            sendHandoverCompletedSMS({
-                recipientPhone: booking.owner_phone,
+            sendHandoverCompletedEmail({
+                recipientEmail: booking.owner_email,
                 recipientName: booking.owner_name,
                 bookingId,
                 equipmentName: booking.equipment_name
-            }).catch(err => console.error("Handover SMS error:", err));
+            }).catch(err => console.error("Handover email error:", err));
 
-            sendHandoverCompletedSMS({
-                recipientPhone: booking.farmer_phone,
+            sendHandoverCompletedEmail({
+                recipientEmail: booking.farmer_email,
                 recipientName: booking.farmer_name,
                 bookingId,
                 equipmentName: booking.equipment_name
-            }).catch(err => console.error("Handover SMS error:", err));
+            }).catch(err => console.error("Handover email error:", err));
         }
 
         return res.status(200).json({
@@ -728,16 +730,16 @@ export const submitFinalInspection = async (req, res) => {
             }
         }
 
-        // Notify counterpart via SMS
-        const recipientPhone = role === "OWNER" ? booking.farmer_phone : booking.owner_phone;
+        // Notify counterpart via Brevo Email
+        const recipientEmail = role === "OWNER" ? booking.farmer_email : booking.owner_email;
         const recipientName = role === "OWNER" ? booking.farmer_name : booking.owner_name;
-        sendInspectionSubmittedSMS({
-            recipientPhone,
+        sendInspectionSubmittedEmail({
+            recipientEmail,
             recipientName,
             bookingId,
             stage: "FINAL",
             inspectorRole: role
-        }).catch(err => console.error("Final inspection SMS error:", err));
+        }).catch(err => console.error("Final inspection email error:", err));
 
         return res.status(200).json({
             success: true,
@@ -1002,38 +1004,38 @@ export const confirmFinalInspection = async (req, res) => {
 
         await connection.commit();
 
-        // 4. Send Return completion / Damage SMS alerts
+        // 4. Send Return completion / Damage Email alerts (via Brevo Email)
         if (returnFinalized) {
             if (damageReported) {
-                sendReturnDamageDisputeSMS({
-                    recipientPhone: booking.owner_phone,
+                sendReturnDamageDisputeEmail({
+                    recipientEmail: booking.owner_email,
                     recipientName: booking.owner_name,
                     bookingId,
                     equipmentName: booking.equipment_name,
                     damageDescription: damageNotes
-                }).catch(err => console.error("Damage SMS error:", err));
+                }).catch(err => console.error("Damage email error:", err));
 
-                sendReturnDamageDisputeSMS({
-                    recipientPhone: booking.farmer_phone,
+                sendReturnDamageDisputeEmail({
+                    recipientEmail: booking.farmer_email,
                     recipientName: booking.farmer_name,
                     bookingId,
                     equipmentName: booking.equipment_name,
                     damageDescription: damageNotes
-                }).catch(err => console.error("Damage SMS error:", err));
+                }).catch(err => console.error("Damage email error:", err));
             } else {
-                sendReturnCompletedSMS({
-                    recipientPhone: booking.owner_phone,
+                sendReturnCompletedEmail({
+                    recipientEmail: booking.owner_email,
                     recipientName: booking.owner_name,
                     bookingId,
                     equipmentName: booking.equipment_name
-                }).catch(err => console.error("Return complete SMS error:", err));
+                }).catch(err => console.error("Return complete email error:", err));
 
-                sendReturnCompletedSMS({
-                    recipientPhone: booking.farmer_phone,
+                sendReturnCompletedEmail({
+                    recipientEmail: booking.farmer_email,
                     recipientName: booking.farmer_name,
                     bookingId,
                     equipmentName: booking.equipment_name
-                }).catch(err => console.error("Return complete SMS error:", err));
+                }).catch(err => console.error("Return complete email error:", err));
             }
         }
 

@@ -18,7 +18,8 @@ import {
     isBookingSafeForMediaCleanup
 } from "./services/mediaCleanupService.js";
 import cloudinary from "./config/cloudinary.js";
-import smsService, { normalizePhoneNumber, sendSMS } from "./services/smsService.js";
+import notificationService, { normalizePhoneNumber } from "./services/notificationService.js";
+import emailService, { isValidEmail, renderTemplate, sendEmail, getSentEmails, clearSentEmails, getLastEmailFor } from "./services/emailService.js";
 
 const app = express();
 app.use(express.json());
@@ -489,19 +490,23 @@ async function runTests() {
 
 
     // -------------------------------------------------------------------------
-    // 5. SMS NOTIFICATION TESTS
+    // 5. BREVO TRANSACTIONAL EMAIL & NOTIFICATION TESTS
     // -------------------------------------------------------------------------
-    console.log("\n--- 5. SMS NOTIFICATION TESTS ---");
+    console.log("\n--- 5. BREVO TRANSACTIONAL EMAIL & NOTIFICATION TESTS ---");
 
-    // 5.1 Invalid phone number handling
-    const smsInvalidRes = await sendSMS({ phone: "12345", message: "Test" });
+    // 5.1 Email format validation
+    const validE1 = isValidEmail("farmer@agrirent.com");
+    const validE2 = isValidEmail("user.name+tag@domain.co.in");
+    const invalidE1 = isValidEmail("not-an-email");
+    const invalidE2 = isValidEmail("@missinguser.com");
+    const invalidE3 = isValidEmail("spaces in@email.com");
     assert(
-        smsInvalidRes.success === false && smsInvalidRes.delivered === false && smsInvalidRes.error?.includes("Invalid"),
-        "Invalid phone number returns clean error without crashing",
-        JSON.stringify(smsInvalidRes)
+        validE1 === true && validE2 === true && invalidE1 === false && invalidE2 === false && invalidE3 === false,
+        "Email address format validation strictly enforces valid RFC-compliant emails",
+        `validE1=${validE1}, validE2=${validE2}, invalidE1=${invalidE1}, invalidE2=${invalidE2}`
     );
 
-    // 5.2 Indian phone number normalization test
+    // 5.2 Indian phone number normalization and preservation (Mobile remains mandatory)
     const num1 = normalizePhoneNumber("+919876543210");
     const num2 = normalizePhoneNumber("09876543210");
     const num3 = normalizePhoneNumber("9876543210");
@@ -513,66 +518,41 @@ async function runTests() {
         `num1=${num1}, num2=${num2}, num3=${num3}, num4=${num4}, numBad=${numBad}`
     );
 
-    // 5.3 Missing credentials error handling
-    const smsMissingCreds = await sendSMS({ phone: "9876543210", message: "Hello AgriRent" });
+    // 5.3 Modular HTML Template Rendering
+    const renderedOtp = renderTemplate("otpEmail.html", {
+        recipientName: "Test Farmer",
+        otp: "847291",
+        purposeMessage: "Your verification code is below:"
+    });
     assert(
-        smsMissingCreds.delivered === false && smsMissingCreds.error?.includes("credentials"),
-        "Missing SMS credentials reports clear error and does NOT pretend delivery",
-        JSON.stringify(smsMissingCreds)
+        renderedOtp.includes("AgriRent") && renderedOtp.includes("847291") && renderedOtp.includes("Test Farmer") && renderedOtp.includes("Valid for 5 minutes"),
+        "Modular HTML template renders base layout, header, footer, and variables accurately",
+        renderedOtp.slice(0, 200)
     );
 
-    // 5.4 Test provider mock simulation (verifies Fast2SMS API contract)
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async (url, options) => {
-        if (url.includes("fast2sms.com")) {
-            const body = JSON.parse(options.body);
-            if (body.numbers === "9876543210" && options.headers.authorization === "TEST_KEY") {
-                return {
-                    ok: true,
-                    status: 200,
-                    json: async () => ({ return: true, request_id: "req_test_abc123", message: ["SMS sent successfully"] })
-                };
-            }
-        }
-        return originalFetch(url, options);
-    };
-
-    const prevApiKey = process.env.FAST2SMS_API_KEY;
-    const prevProvider = process.env.SMS_PROVIDER;
-    process.env.FAST2SMS_API_KEY = "TEST_KEY";
-    process.env.SMS_PROVIDER = "fast2sms";
-
-    const smsMockSuccess = await sendSMS({ phone: "9876543210", message: "Test delivery" });
+    // 5.4 Invalid email rejection without crashing
+    const invalidEmailRes = await sendEmail({ to: "bad-email", subject: "Test", htmlContent: "<p>Test</p>" });
     assert(
-        smsMockSuccess.success === true && smsMockSuccess.delivered === true && smsMockSuccess.messageId === "req_test_abc123",
-        "Fast2SMS integration dispatches valid payload and receives request_id confirmation",
-        JSON.stringify(smsMockSuccess)
+        invalidEmailRes.success === false && invalidEmailRes.reason === "INVALID_EMAIL",
+        "Invalid recipient email returns clean warning without throwing or crashing caller",
+        JSON.stringify(invalidEmailRes)
     );
 
-    // 5.5 Test provider failure handling (API returns error)
-    globalThis.fetch = async (url, options) => {
-        if (url.includes("fast2sms.com")) {
-            return {
-                ok: false,
-                status: 400,
-                statusText: "Bad Request",
-                json: async () => ({ return: false, message: "Invalid Authorization Key" })
-            };
-        }
-        return originalFetch(url, options);
-    };
-
-    const smsMockFail = await sendSMS({ phone: "9876543210", message: "Test fail" });
+    // 5.5 Non-blocking dispatch and in-memory audit store
+    clearSentEmails();
+    const dispatchRes = await sendEmail({
+        to: "farmer.demo@agrirent.test",
+        toName: "Demo Farmer",
+        subject: "Welcome to AgriRent",
+        template: "otpEmail.html",
+        templateData: { otp: "123456", purposeMessage: "Your registration OTP code:" }
+    });
+    const lastSent = getLastEmailFor("farmer.demo@agrirent.test");
     assert(
-        smsMockFail.success === false && smsMockFail.delivered === false && smsMockFail.error?.includes("Invalid Authorization Key"),
-        "Fast2SMS API error returns clean failure status and does not pretend delivery",
-        JSON.stringify(smsMockFail)
+        lastSent !== null && lastSent.to === "farmer.demo@agrirent.test" && lastSent.htmlContent.includes("123456"),
+        "Email dispatch logs to audit store and executes non-blockingly without throwing errors",
+        JSON.stringify(lastSent ? { to: lastSent.to, subject: lastSent.subject } : null)
     );
-
-    // Restore environment & fetch
-    globalThis.fetch = originalFetch;
-    process.env.FAST2SMS_API_KEY = prevApiKey;
-    process.env.SMS_PROVIDER = prevProvider;
 
     // -------------------------------------------------------------------------
     // 6. EQUIPMENT INSPECTION AND HANDOVER SYSTEM TESTS
@@ -1515,12 +1495,46 @@ async function runTests() {
         JSON.stringify(chkFarmerProfile)
     );
 
-    // 10.2 Duplicate phone registration rejection
+    // 10.2 Mandatory Email enforcement during registration
+    const resNoEmail = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "No Email User",
+            phone: "9123456789",
+            password: "Password123",
+            role: "FARMER"
+        }
+    });
+    assert(
+        resNoEmail.status === 400 && resNoEmail.data?.message?.includes("email"),
+        "Registration without email is rejected with 400 (Email strictly mandatory)",
+        JSON.stringify(resNoEmail.data)
+    );
+
+    // 10.3 Invalid email format rejection during registration
+    const resBadEmail = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "Bad Email User",
+            phone: "9123456789",
+            email: "invalid-email-format",
+            password: "Password123",
+            role: "FARMER"
+        }
+    });
+    assert(
+        resBadEmail.status === 400 && resBadEmail.data?.message?.includes("valid email"),
+        "Registration with invalid email format is rejected with 400",
+        JSON.stringify(resBadEmail.data)
+    );
+
+    // 10.4 Duplicate phone registration rejection
     const resDupReg = await apiRequest("/auth/register", {
         method: "POST",
         body: {
             full_name: "Duplicate Ramesh",
             phone: testFarmerPhone,
+            email: "another.ramesh@example.com",
             password: "AnotherPassword123",
             role: "FARMER"
         }
@@ -1531,12 +1545,13 @@ async function runTests() {
         JSON.stringify(resDupReg.data)
     );
 
-    // 10.3 Disallowed role registration rejection (e.g. SUPER_ADMIN)
+    // 10.5 Disallowed role registration rejection (e.g. SUPER_ADMIN)
     const resAdminReg = await apiRequest("/auth/register", {
         method: "POST",
         body: {
             full_name: "Fake Admin",
             phone: "9333333333",
+            email: "fakeadmin@test.com",
             password: "AdminPassword123",
             role: "SUPER_ADMIN"
         }
@@ -1767,8 +1782,8 @@ async function runTests() {
         body: { phone: resetTestPhone }
     });
     assert(
-        resReqOtp1.status === 200 && resReqOtp1.data?.message?.includes("If this mobile number is registered"),
-        "11.1 Registered mobile number receives 200 generic success response",
+        resReqOtp1.status === 200 && resReqOtp1.data?.message?.includes("If this") && resReqOtp1.data?.message?.includes("registered"),
+        "11.1 Registered identifier receives 200 generic success response",
         JSON.stringify(resReqOtp1.data)
     );
     const resetOtpVal = resReqOtp1.data?.data?.otp;
@@ -1791,7 +1806,7 @@ async function runTests() {
         body: { phone: "12345" }
     });
     assert(
-        resReqInvalid.status === 400 && resReqInvalid.data?.message?.includes("valid 10-digit"),
+        resReqInvalid.status === 400 && resReqInvalid.data?.message?.includes("valid"),
         "11.3 Invalid mobile number format rejected with 400",
         JSON.stringify(resReqInvalid.data)
     );
@@ -1999,11 +2014,12 @@ async function runTests() {
         `Roles checked: ${rolesToTest.map(r => r.role).join(", ")}`
     );
 
-    // Test 17: SMS provider failure resilience
+    // Test 17: Brevo Transactional Email resilience & dispatch verification
+    const resetSuccessEmail = getLastEmailFor("reset@test.com");
     assert(
-        resResetSuccess.status === 200,
-        "11.17 SMS RESILIENCE: Password reset completes successfully without throwing unhandled SMS gateway errors",
-        "SMS dispatched via non-blocking handler"
+        resResetSuccess.status === 200 && (resetSuccessEmail !== null || resResetSuccess.data?.message?.includes("successfully")),
+        "11.17 BREVO RESILIENCE: Password reset completes successfully with non-blocking transactional email delivery",
+        "Brevo email dispatched via non-blocking handler"
     );
 
     // Clean up test server

@@ -1,11 +1,11 @@
 import pool from "../db.js";
 import cloudinary from "../config/cloudinary.js";
 import {
-    sendSuperAdminDisputeDecisionSMS,
-    sendAdditionalEvidenceRequestedSMS,
-    sendAccountActionSMS,
-    sendSuperAdminEscalationSMS
-} from "../services/smsService.js";
+    sendSuperAdminDisputeDecisionEmail,
+    sendAdditionalEvidenceRequestedEmail,
+    sendAccountActionEmail,
+    sendSuperAdminEscalationEmail
+} from "../services/notificationService.js";
 
 const VALID_CASE_STATUSES = [
     "OPEN",
@@ -528,7 +528,7 @@ export const requestAdditionalEvidence = async (req, res) => {
         // Lock dispute row
         const [disputes] = await connection.query(
             `SELECT rd.id, rd.booking_id, rd.status, rd.assigned_area_admin_id,
-                    aa.id AS area_admin_id, u.phone AS admin_phone, u.full_name AS admin_name
+                    aa.id AS area_admin_id, u.email AS admin_email, u.phone AS admin_phone, u.full_name AS admin_name
              FROM refund_disputes rd
              LEFT JOIN area_admins aa ON rd.assigned_area_admin_id = aa.id
              LEFT JOIN users u ON aa.user_id = u.id
@@ -573,15 +573,15 @@ export const requestAdditionalEvidence = async (req, res) => {
 
         await connection.commit();
 
-        // Dispatch SMS to Area Admin
-        if (dispute.admin_phone) {
-            sendAdditionalEvidenceRequestedSMS({
-                adminPhone: dispute.admin_phone,
+        // Dispatch Email to Area Admin (via Brevo Email)
+        if (dispute.admin_email) {
+            sendAdditionalEvidenceRequestedEmail({
+                adminEmail: dispute.admin_email,
                 adminName: dispute.admin_name,
                 disputeId,
                 bookingId: dispute.booking_id,
                 instructions: instructions.trim()
-            }).catch(err => console.error("Evidence request SMS error:", err));
+            }).catch(err => console.error("Evidence request email error:", err));
         }
 
         return res.status(200).json({
@@ -664,10 +664,13 @@ export const submitFinalDisputeDecision = async (req, res) => {
                 e.name AS equipment_name,
                 bp.amount AS payment_amount,
                 bp.refund_status,
+                fu.email AS farmer_email,
                 fu.phone AS farmer_phone,
                 fu.full_name AS farmer_name,
+                ou.email AS owner_email,
                 ou.phone AS owner_phone,
                 ou.full_name AS owner_name,
+                aau.email AS admin_email,
                 aau.phone AS admin_phone,
                 aau.full_name AS admin_name
              FROM refund_disputes rd
@@ -816,7 +819,7 @@ export const submitFinalDisputeDecision = async (req, res) => {
 
         await connection.commit();
 
-        // 5. Multi-Party SMS Notifications (Feature 6)
+        // 5. Multi-Party Email Notifications (via Brevo Email)
         const notifyParams = {
             disputeId,
             bookingId: d.booking_id,
@@ -824,28 +827,28 @@ export const submitFinalDisputeDecision = async (req, res) => {
             remarks: reason.trim()
         };
 
-        if (d.farmer_phone) {
-            sendSuperAdminDisputeDecisionSMS({
-                recipientPhone: d.farmer_phone,
+        if (d.farmer_email) {
+            sendSuperAdminDisputeDecisionEmail({
+                recipientEmail: d.farmer_email,
                 recipientName: d.farmer_name,
                 ...notifyParams
-            }).catch(err => console.error("Farmer decision SMS error:", err));
+            }).catch(err => console.error("Farmer decision email error:", err));
         }
 
-        if (d.owner_phone) {
-            sendSuperAdminDisputeDecisionSMS({
-                recipientPhone: d.owner_phone,
+        if (d.owner_email) {
+            sendSuperAdminDisputeDecisionEmail({
+                recipientEmail: d.owner_email,
                 recipientName: d.owner_name,
                 ...notifyParams
-            }).catch(err => console.error("Owner decision SMS error:", err));
+            }).catch(err => console.error("Owner decision email error:", err));
         }
 
-        if (d.admin_phone) {
-            sendSuperAdminDisputeDecisionSMS({
-                recipientPhone: d.admin_phone,
+        if (d.admin_email) {
+            sendSuperAdminDisputeDecisionEmail({
+                recipientEmail: d.admin_email,
                 recipientName: d.admin_name,
                 ...notifyParams
-            }).catch(err => console.error("Area Admin decision SMS error:", err));
+            }).catch(err => console.error("Area Admin decision email error:", err));
         }
 
         return res.status(200).json({
@@ -908,7 +911,7 @@ export const executeUserAccountAction = async (req, res) => {
 
         // Verify target user exists and is not a SUPER_ADMIN
         const [users] = await pool.query(
-            "SELECT id, full_name, phone, role, status, warning_count FROM users WHERE id = ?",
+            "SELECT id, full_name, email, phone, role, status, warning_count FROM users WHERE id = ?",
             [userId]
         );
 
@@ -982,15 +985,15 @@ export const executeUserAccountAction = async (req, res) => {
             [disputeId || null, userId, auditAction, req.user.id, JSON.stringify({ actionType, reason: reason.trim(), durationDays: durationDays || null })]
         );
 
-        // Notify user via SMS
-        if (targetUser.phone) {
-            sendAccountActionSMS({
-                recipientPhone: targetUser.phone,
+        // Notify user via Brevo Email
+        if (targetUser.email) {
+            sendAccountActionEmail({
+                recipientEmail: targetUser.email,
                 recipientName: targetUser.full_name,
                 actionType,
                 reason: reason.trim(),
                 duration: durationStr
-            }).catch(err => console.error("Account action SMS error:", err));
+            }).catch(err => console.error("Account action email error:", err));
         }
 
         return res.status(200).json({
@@ -1401,21 +1404,21 @@ export const escalateDisputeToSuperAdmin = async (req, res) => {
             [disputeId, req.user.id, `Manual escalation: ${reason.trim()}`]
         );
 
-        // Fetch Super Admin for SMS notification
+        // Fetch Super Admin for Email notification
         const [superAdmins] = await connection.query(
-            "SELECT phone, full_name FROM users WHERE role = 'SUPER_ADMIN' AND status = 'ACTIVE' LIMIT 1"
+            "SELECT email, phone, full_name FROM users WHERE role = 'SUPER_ADMIN' AND status = 'ACTIVE' LIMIT 1"
         );
 
         await connection.commit();
 
-        if (superAdmins.length > 0 && superAdmins[0].phone) {
-            sendSuperAdminEscalationSMS({
-                superAdminPhone: superAdmins[0].phone,
+        if (superAdmins.length > 0 && superAdmins[0].email) {
+            sendSuperAdminEscalationEmail({
+                superAdminEmail: superAdmins[0].email,
                 superAdminName: superAdmins[0].full_name,
                 disputeId,
                 bookingId: dispute.booking_id,
                 reason: reason.trim()
-            }).catch(err => console.error("Escalation SMS error:", err));
+            }).catch(err => console.error("Escalation email error:", err));
         }
 
         return res.status(200).json({

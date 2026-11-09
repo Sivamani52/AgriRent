@@ -1,9 +1,9 @@
 import pool from "../db.js";
 import {
-    sendBookingRequestSMS,
-    sendBookingAcceptedSMS,
-    sendBookingRejectedSMS
-} from "../services/smsService.js";
+    sendBookingRequestEmail,
+    sendBookingAcceptedEmail,
+    sendBookingRejectedEmail
+} from "../services/notificationService.js";
 
 export const createBooking = async (req, res) => {
     try {
@@ -104,6 +104,7 @@ export const createBooking = async (req, res) => {
                     e.verification_status,
                     e.location_id,
                     e.owner_id,
+                    ou.email AS owner_email,
                     ou.phone AS owner_phone,
                     ou.full_name AS owner_name
                  FROM equipment e
@@ -249,12 +250,14 @@ export const createBooking = async (req, res) => {
 
             await connection.commit();
 
-            sendBookingRequestSMS({
-                ownerPhone: selectedEquipment.owner_phone,
+            sendBookingRequestEmail({
+                ownerEmail: selectedEquipment.owner_email,
                 ownerName: selectedEquipment.owner_name,
                 equipmentName: selectedEquipment.name,
-                bookingId: result.insertId
-            }).catch(err => console.error("Booking request SMS error:", err));
+                bookingId: result.insertId,
+                totalAmount,
+                advanceAmount
+            }).catch(err => console.error("Booking request email error:", err));
 
             return res.status(201).json({
                 success: true,
@@ -325,6 +328,7 @@ export const acceptBooking = async (req, res) => {
                 e.status AS equipment_status,
                 e.name AS equipment_name,
                 e.owner_id,
+                fu.email AS farmer_email,
                 fu.phone AS farmer_phone,
                 fu.full_name AS farmer_name
              FROM bookings b
@@ -394,13 +398,13 @@ export const acceptBooking = async (req, res) => {
             [paymentDeadline, bookingId]
         );
 
-        sendBookingAcceptedSMS({
-            farmerPhone: booking.farmer_phone,
+        sendBookingAcceptedEmail({
+            farmerEmail: booking.farmer_email,
             farmerName: booking.farmer_name,
             equipmentName: booking.equipment_name,
             bookingId: Number(bookingId),
             advanceAmount: booking.advance_amount
-        }).catch(err => console.error("Booking accepted SMS error:", err));
+        }).catch(err => console.error("Booking accepted email error:", err));
 
         return res.status(200).json({
             success: true,
@@ -460,6 +464,7 @@ export const rejectBooking = async (req, res) => {
                 (b.created_at <= DATE_SUB(NOW(), INTERVAL 4 HOUR)) AS is_expired,
                 e.owner_id,
                 e.name AS equipment_name,
+                fu.email AS farmer_email,
                 fu.phone AS farmer_phone,
                 fu.full_name AS farmer_name
              FROM bookings b
@@ -518,13 +523,13 @@ export const rejectBooking = async (req, res) => {
             [reason.trim(), bookingId]
         );
 
-        sendBookingRejectedSMS({
-            farmerPhone: booking.farmer_phone,
+        sendBookingRejectedEmail({
+            farmerEmail: booking.farmer_email,
             farmerName: booking.farmer_name,
             equipmentName: booking.equipment_name,
             bookingId: Number(bookingId),
             reason: reason.trim()
-        }).catch(err => console.error("Booking rejected SMS error:", err));
+        }).catch(err => console.error("Booking rejected email error:", err));
 
         return res.status(200).json({
             success: true,

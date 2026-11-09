@@ -1,12 +1,12 @@
 import pool from "../db.js";
 import {
-    sendBookingReminderSMS,
-    sendBookingAutoCancelledSMS,
-    sendPaymentRejectedSMS,
-    sendRefundReminderSMS,
-    sendAreaAdminDisputeSMS,
-    sendSuperAdminEscalationSMS
-} from "./smsService.js";
+    sendBookingReminderEmail,
+    sendBookingAutoCancelledEmail,
+    sendPaymentRejectedEmail,
+    sendRefundReminderEmail,
+    sendAreaAdminDisputeEmail,
+    sendSuperAdminEscalationEmail
+} from "./notificationService.js";
 
 /**
  * Checks owner booking acceptance timeouts:
@@ -23,6 +23,7 @@ export const checkBookingAcceptanceTimeouts = async () => {
                 b.id AS booking_id,
                 b.created_at,
                 u.id AS owner_user_id,
+                u.email AS owner_email,
                 u.full_name AS owner_name,
                 u.phone AS owner_phone,
                 e.name AS equipment_name
@@ -46,12 +47,12 @@ export const checkBookingAcceptanceTimeouts = async () => {
             );
 
             if (updateResult.affectedRows > 0) {
-                sendBookingReminderSMS({
-                    ownerPhone: booking.owner_phone,
+                sendBookingReminderEmail({
+                    ownerEmail: booking.owner_email,
                     ownerName: booking.owner_name,
                     bookingId: booking.booking_id,
                     equipmentName: booking.equipment_name
-                }).catch(err => console.error("Booking reminder SMS error:", err));
+                }).catch(err => console.error("Booking reminder email error:", err));
             }
         }
 
@@ -61,8 +62,10 @@ export const checkBookingAcceptanceTimeouts = async () => {
                 b.id AS booking_id,
                 b.equipment_id,
                 b.created_at,
+                ou.email AS owner_email,
                 ou.full_name AS owner_name,
                 ou.phone AS owner_phone,
+                fu.email AS farmer_email,
                 fu.full_name AS farmer_name,
                 fu.phone AS farmer_phone,
                 e.name AS equipment_name
@@ -151,23 +154,23 @@ export const checkBookingAcceptanceTimeouts = async () => {
 
                 await connection.commit();
 
-                // 5. Send cancellation notifications only if the row was indeed updated
+                // 5. Send cancellation notifications only if the row was indeed updated (via Brevo Email)
                 if (cancelResult.affectedRows > 0) {
-                    sendBookingAutoCancelledSMS({
-                        recipientPhone: booking.farmer_phone,
+                    sendBookingAutoCancelledEmail({
+                        recipientEmail: booking.farmer_email,
                         recipientName: booking.farmer_name,
                         recipientRole: "FARMER",
                         bookingId: booking.booking_id,
                         equipmentName: booking.equipment_name
-                    }).catch(err => console.error("Farmer auto-cancel SMS error:", err));
+                    }).catch(err => console.error("Farmer auto-cancel email error:", err));
 
-                    sendBookingAutoCancelledSMS({
-                        recipientPhone: booking.owner_phone,
+                    sendBookingAutoCancelledEmail({
+                        recipientEmail: booking.owner_email,
                         recipientName: booking.owner_name,
                         recipientRole: "OWNER",
                         bookingId: booking.booking_id,
                         equipmentName: booking.equipment_name
-                    }).catch(err => console.error("Owner auto-cancel SMS error:", err));
+                    }).catch(err => console.error("Owner auto-cancel email error:", err));
                 }
 
             } catch (err) {
@@ -237,8 +240,10 @@ export const checkPaymentVerificationTimeouts = async () => {
                 bp.booking_id,
                 bp.amount,
                 b.equipment_id,
+                ou.email AS owner_email,
                 ou.phone AS owner_phone,
                 ou.full_name AS owner_name,
+                fu.email AS farmer_email,
                 fu.phone AS farmer_phone,
                 fu.full_name AS farmer_name
              FROM booking_payments bp
@@ -308,13 +313,13 @@ export const checkPaymentVerificationTimeouts = async () => {
 
                 await connection.commit();
 
-                sendPaymentRejectedSMS({
-                    farmerPhone: payment.farmer_phone,
+                sendPaymentRejectedEmail({
+                    farmerEmail: payment.farmer_email,
                     farmerName: payment.farmer_name,
                     bookingId: payment.booking_id,
                     amount: payment.amount,
                     reason: "Owner did not verify payment within the allowed time"
-                }).catch(err => console.error("Auto-reject farmer SMS error:", err));
+                }).catch(err => console.error("Auto-reject farmer email error:", err));
 
             } catch (err) {
                 await connection.rollback();
@@ -334,6 +339,7 @@ export const checkPaymentVerificationTimeouts = async () => {
                 bp.farmer_refund_response_deadline,
                 e.location_id,
                 fu.id AS farmer_user_id,
+                fu.email AS farmer_email,
                 fu.phone AS farmer_phone,
                 fu.full_name AS farmer_name
              FROM booking_payments bp
@@ -372,7 +378,7 @@ export const checkPaymentVerificationTimeouts = async () => {
 
                 // Find assigned Area Admin for the booking location
                 const [adminRows] = await connection.query(
-                    `SELECT aa.id, aa.user_id, u.phone AS admin_phone, u.full_name AS admin_name
+                    `SELECT aa.id, aa.user_id, u.email AS admin_email, u.phone AS admin_phone, u.full_name AS admin_name
                      FROM area_admins aa
                      JOIN users u ON aa.user_id = u.id
                      WHERE aa.location_id = ?
@@ -408,22 +414,22 @@ export const checkPaymentVerificationTimeouts = async () => {
 
                 await connection.commit();
 
-                // Send SMS notifications (non-blocking)
-                sendRefundReminderSMS({
-                    farmerPhone: payment.farmer_phone,
+                // Send Email notifications (non-blocking via Brevo Email)
+                sendRefundReminderEmail({
+                    farmerEmail: payment.farmer_email,
                     farmerName: payment.farmer_name,
                     bookingId: payment.booking_id,
                     amount: payment.amount
-                }).catch(err => console.error("Farmer refund reminder SMS error:", err));
+                }).catch(err => console.error("Farmer refund reminder email error:", err));
 
-                if (assignedAdmin && assignedAdmin.admin_phone) {
-                    sendAreaAdminDisputeSMS({
-                        adminPhone: assignedAdmin.admin_phone,
+                if (assignedAdmin && assignedAdmin.admin_email) {
+                    sendAreaAdminDisputeEmail({
+                        adminEmail: assignedAdmin.admin_email,
                         adminName: assignedAdmin.admin_name,
                         bookingId: payment.booking_id,
                         disputeId,
                         disputeReason: "Farmer did not confirm refund within 24-hour response deadline"
-                    }).catch(err => console.error("Area admin dispute SMS error:", err));
+                    }).catch(err => console.error("Area admin dispute email error:", err));
                 }
 
             } catch (err) {
@@ -441,11 +447,12 @@ export const checkPaymentVerificationTimeouts = async () => {
                 rd.id AS dispute_id,
                 rd.payment_id,
                 rd.booking_id,
+                su.email AS super_admin_email,
                 su.phone AS super_admin_phone,
                 su.full_name AS super_admin_name
              FROM refund_disputes rd
              CROSS JOIN (
-                 SELECT phone, full_name
+                 SELECT email, phone, full_name
                  FROM users
                  WHERE role = 'SUPER_ADMIN' AND status = 'ACTIVE'
                  LIMIT 1
@@ -481,14 +488,14 @@ export const checkPaymentVerificationTimeouts = async () => {
 
                 await connection.commit();
 
-                if (dispute.super_admin_phone) {
-                    sendSuperAdminEscalationSMS({
-                        superAdminPhone: dispute.super_admin_phone,
+                if (dispute.super_admin_email) {
+                    sendSuperAdminEscalationEmail({
+                        superAdminEmail: dispute.super_admin_email,
                         superAdminName: dispute.super_admin_name,
                         disputeId: dispute.dispute_id,
                         bookingId: dispute.booking_id,
                         reason: "Exceeded 48-hour resolution deadline"
-                    }).catch(err => console.error("Super Admin escalation SMS error:", err));
+                    }).catch(err => console.error("Super Admin escalation email error:", err));
                 }
 
             } catch (err) {

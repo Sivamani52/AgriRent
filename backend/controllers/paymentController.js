@@ -1,12 +1,12 @@
 import pool from "../db.js";
 import {
-    sendPaymentSubmittedSMS,
-    sendPaymentVerifiedSMS,
-    sendPaymentRejectedSMS,
-    sendRefundInitiatedSMS,
-    sendRefundDisputeSMS,
-    sendAreaAdminDisputeSMS
-} from "../services/smsService.js";
+    sendPaymentSubmittedEmail,
+    sendPaymentVerifiedEmail,
+    sendPaymentRejectedEmail,
+    sendRefundInitiatedEmail,
+    sendRefundDisputeEmail,
+    sendAreaAdminDisputeEmail
+} from "../services/notificationService.js";
 
 /**
  * Farmer submits advance payment for an accepted booking.
@@ -44,6 +44,7 @@ export const submitPayment = async (req, res) => {
                 b.payment_deadline,
                 (b.payment_deadline > NOW()) AS payment_window_open,
                 f.user_id AS farmer_user_id,
+                ou.email AS owner_email,
                 ou.phone AS owner_phone,
                 ou.full_name AS owner_name,
                 e.name AS equipment_name
@@ -150,14 +151,15 @@ export const submitPayment = async (req, res) => {
 
         await connection.commit();
 
-        // Send SMS notification to owner (Event 6)
-        sendPaymentSubmittedSMS({
-            ownerPhone: booking.owner_phone,
+        // Send Email notification to owner (Event 6)
+        sendPaymentSubmittedEmail({
+            ownerEmail: booking.owner_email,
             ownerName: booking.owner_name,
             bookingId: booking_id,
             amount: booking.advance_amount,
-            transactionId: transaction_id.trim()
-        }).catch(err => console.error("Payment submitted SMS error:", err));
+            transactionId: transaction_id.trim(),
+            equipmentName: booking.equipment_name
+        }).catch(err => console.error("Payment submitted email error:", err));
 
         return res.status(201).json({
             success: true,
@@ -208,6 +210,7 @@ export const verifyPayment = async (req, res) => {
                 b.status AS booking_status,
                 b.equipment_id,
                 o.user_id AS owner_user_id,
+                fu.email AS farmer_email,
                 fu.phone AS farmer_phone,
                 fu.full_name AS farmer_name,
                 e.name AS equipment_name
@@ -298,13 +301,14 @@ export const verifyPayment = async (req, res) => {
 
         await connection.commit();
 
-        // Send SMS to Farmer (Event 7, non-blocking)
-        sendPaymentVerifiedSMS({
-            farmerPhone: payment.farmer_phone,
+        // Send Email to Farmer (Event 7, non-blocking)
+        sendPaymentVerifiedEmail({
+            farmerEmail: payment.farmer_email,
             farmerName: payment.farmer_name,
             bookingId: payment.booking_id,
-            amount: payment.amount
-        }).catch(err => console.error("Payment verified SMS error:", err));
+            amount: payment.amount,
+            equipmentName: payment.equipment_name
+        }).catch(err => console.error("Payment verified email error:", err));
 
         return res.status(200).json({
             success: true,
@@ -360,6 +364,7 @@ export const rejectPayment = async (req, res) => {
                 b.status AS booking_status,
                 b.equipment_id,
                 o.user_id AS owner_user_id,
+                fu.email AS farmer_email,
                 fu.phone AS farmer_phone,
                 fu.full_name AS farmer_name
              FROM booking_payments bp
@@ -454,14 +459,14 @@ export const rejectPayment = async (req, res) => {
 
         await connection.commit();
 
-        // Send SMS to Farmer (Event 8, non-blocking)
-        sendPaymentRejectedSMS({
-            farmerPhone: payment.farmer_phone,
+        // Send Email to Farmer (Event 8, non-blocking)
+        sendPaymentRejectedEmail({
+            farmerEmail: payment.farmer_email,
             farmerName: payment.farmer_name,
             bookingId: payment.booking_id,
             amount: payment.amount,
             reason: reason.trim()
-        }).catch(err => console.error("Payment rejected SMS error:", err));
+        }).catch(err => console.error("Payment rejected email error:", err));
 
         return res.status(200).json({
             success: true,
@@ -518,6 +523,7 @@ export const submitRefund = async (req, res) => {
                 (bp.refund_deadline > NOW()) AS refund_window_open,
                 o.user_id AS owner_user_id,
                 e.location_id,
+                fu.email AS farmer_email,
                 fu.phone AS farmer_phone,
                 fu.full_name AS farmer_name
              FROM booking_payments bp
@@ -635,14 +641,14 @@ export const submitRefund = async (req, res) => {
 
         await connection.commit();
 
-        // Send SMS to Farmer (Event 9, non-blocking)
-        sendRefundInitiatedSMS({
-            farmerPhone: payment.farmer_phone,
+        // Send Email to Farmer (Event 9, non-blocking)
+        sendRefundInitiatedEmail({
+            farmerEmail: payment.farmer_email,
             farmerName: payment.farmer_name,
             bookingId: payment.booking_id,
             amount: payment.amount,
             refundTransactionId: refund_transaction_id.trim()
-        }).catch(err => console.error("Refund initiated SMS error:", err));
+        }).catch(err => console.error("Refund initiated email error:", err));
 
         const updatedPayment = updatedRows[0];
 
@@ -876,8 +882,10 @@ export const disputeRefund = async (req, res) => {
                 bp.refund_submitted_at,
                 f.user_id AS farmer_user_id,
                 e.location_id,
+                ou.email AS owner_email,
                 ou.phone AS owner_phone,
                 ou.full_name AS owner_name,
+                fu.email AS farmer_email,
                 fu.phone AS farmer_phone,
                 fu.full_name AS farmer_name
              FROM booking_payments bp
@@ -946,7 +954,7 @@ export const disputeRefund = async (req, res) => {
 
         // Find assigned Area Admin for the booking/equipment location
         const [adminRows] = await connection.query(
-            `SELECT aa.id, aa.user_id, u.phone AS admin_phone, u.full_name AS admin_name
+            `SELECT aa.id, aa.user_id, u.email AS admin_email, u.phone AS admin_phone, u.full_name AS admin_name
              FROM area_admins aa
              JOIN users u ON aa.user_id = u.id
              WHERE aa.location_id = ?
@@ -984,29 +992,29 @@ export const disputeRefund = async (req, res) => {
 
         await connection.commit();
 
-        // Send notifications (Event 11 & 12, non-blocking)
-        sendRefundDisputeSMS({
-            recipientPhone: payment.farmer_phone,
+        // Send notifications (Event 11 & 12, non-blocking via Brevo Email)
+        sendRefundDisputeEmail({
+            recipientEmail: payment.farmer_email,
             recipientName: payment.farmer_name,
             bookingId: payment.booking_id,
             disputeReason: reason.trim()
-        }).catch(err => console.error("Dispute farmer SMS error:", err));
+        }).catch(err => console.error("Dispute farmer email error:", err));
 
-        sendRefundDisputeSMS({
-            recipientPhone: payment.owner_phone,
+        sendRefundDisputeEmail({
+            recipientEmail: payment.owner_email,
             recipientName: payment.owner_name,
             bookingId: payment.booking_id,
             disputeReason: reason.trim()
-        }).catch(err => console.error("Dispute owner SMS error:", err));
+        }).catch(err => console.error("Dispute owner email error:", err));
 
-        if (adminData && adminData.admin_phone) {
-            sendAreaAdminDisputeSMS({
-                adminPhone: adminData.admin_phone,
+        if (adminData && adminData.admin_email) {
+            sendAreaAdminDisputeEmail({
+                adminEmail: adminData.admin_email,
                 adminName: adminData.admin_name,
                 bookingId: payment.booking_id,
                 disputeId,
                 disputeReason: reason.trim()
-            }).catch(err => console.error("Dispute area admin SMS error:", err));
+            }).catch(err => console.error("Dispute area admin email error:", err));
         }
 
         return res.status(200).json({
