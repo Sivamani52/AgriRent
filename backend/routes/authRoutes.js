@@ -4,7 +4,10 @@ import {
     sendOTP,
     verifyOTP,
     login,
-    getCurrentUser
+    getCurrentUser,
+    requestPasswordResetOTP,
+    verifyPasswordResetOTP,
+    resetPassword
 } from "../controllers/authController.js";
 import { authenticateUser } from "../middleware/authMiddleware.js";
 
@@ -24,6 +27,11 @@ router.post("/auth/login", login);
 
 // 5. Authenticated User Profile
 router.get("/auth/me", authenticateUser, getCurrentUser);
+
+// 6. Password Reset Flow
+router.post("/auth/password-reset/request", requestPasswordResetOTP);
+router.post("/auth/password-reset/verify", verifyPasswordResetOTP);
+router.post("/auth/password-reset/reset", resetPassword);
 
 export default router;
 

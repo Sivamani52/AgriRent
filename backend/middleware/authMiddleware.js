@@ -52,7 +52,7 @@ export const authenticateUser = async (req, res, next) => {
             });
         }
         const [users] = await pool.query(
-            "SELECT id, full_name, phone, email, role, status, suspended_until, suspension_reason FROM users WHERE id = ?",
+            "SELECT id, full_name, phone, email, role, status, suspended_until, suspension_reason, password_changed_at FROM users WHERE id = ?",
             [userId]
         );
 
@@ -64,6 +64,18 @@ export const authenticateUser = async (req, res, next) => {
         }
 
         const user = users[0];
+
+        // Invalidate sessions issued before recent password reset
+        if (decoded.iat && user.password_changed_at) {
+            const passwordChangedEpoch = new Date(user.password_changed_at).getTime();
+            const tokenIssuedEpoch = decoded.iat * 1000;
+            if (tokenIssuedEpoch < passwordChangedEpoch) {
+                return res.status(401).json({
+                    success: false,
+                    message: "Session expired due to a recent password reset. Please log in again."
+                });
+            }
+        }
 
         // Check if temporary suspension has expired
         if (user.status === "SUSPENDED") {

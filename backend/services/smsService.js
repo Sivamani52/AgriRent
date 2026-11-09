@@ -431,10 +431,34 @@ export const sendOTPSMS = async ({ phone, otp }) => {
     });
 };
 
+/**
+ * Password Reset OTP SMS
+ */
+export const sendPasswordResetOTPSMS = async ({ phone, otp }) => {
+    return sendSMS({
+        phone,
+        eventType: "AUTH_PASSWORD_RESET_OTP",
+        message: `AgriRent: Your password reset verification OTP is ${otp}. Valid for 5 minutes. Do not share this OTP with anyone.`
+    });
+};
+
+/**
+ * Password Reset Success Confirmation SMS
+ */
+export const sendPasswordResetSuccessSMS = async ({ phone, userName }) => {
+    return sendSMS({
+        phone,
+        eventType: "AUTH_PASSWORD_RESET_SUCCESS",
+        message: `AgriRent: Hello ${userName || "User"}, your account password was successfully reset. If you did not make this change, please contact support immediately.`
+    });
+};
+
 export default {
     sendSMS,
     normalizePhoneNumber,
     sendOTPSMS,
+    sendPasswordResetOTPSMS,
+    sendPasswordResetSuccessSMS,
     sendBookingRequestSMS,
     sendBookingReminderSMS,
     sendBookingAutoCancelledSMS,

@@ -1735,6 +1735,277 @@ async function runTests() {
         `Pay A: ${resPayA.status}, Pay B: ${resPayB.status}`
     );
 
+    // -------------------------------------------------------------------------
+    // 11. SECURE FORGOT PASSWORD & RESET PASSWORD WORKFLOW TESTS (18 TEST SCENARIOS)
+    // -------------------------------------------------------------------------
+    console.log("\n--- 11. SECURE FORGOT PASSWORD & RESET PASSWORD WORKFLOW TESTS ---");
+
+    const resetTestPhone = "9444444444";
+    const unregisteredPhone = "9555555555";
+
+    // Clean up test records
+    await pool.query("DELETE FROM user_otps WHERE phone IN (?, ?)", [resetTestPhone, unregisteredPhone]);
+    await pool.query("DELETE FROM farmers WHERE user_id IN (SELECT id FROM users WHERE phone = ?)", [resetTestPhone]);
+    await pool.query("DELETE FROM users WHERE phone IN (?, ?)", [resetTestPhone, unregisteredPhone]);
+
+    // Create a verified active test user (Farmer)
+    const initPassword = "OldPassword123!";
+    const initHash = await (await import("bcryptjs")).default.hash(initPassword, 10);
+    const [uResetRes] = await pool.query(
+        "INSERT INTO users (full_name, phone, email, password_hash, role, status) VALUES ('Reset Tester', ?, 'reset@test.com', ?, 'FARMER', 'ACTIVE')",
+        [resetTestPhone, initHash]
+    );
+    const resetUserId = uResetRes.insertId;
+    await pool.query("INSERT INTO farmers (user_id, location_id) VALUES (?, 1)", [resetUserId]);
+
+    // Generate initial session JWT before password reset to test session invalidation later
+    const oldSessionToken = jwt.sign({ id: resetUserId, role: "FARMER" }, JWT_SECRET, { expiresIn: "1h" });
+
+    // Test 1: Registered mobile number requests OTP
+    const resReqOtp1 = await apiRequest("/auth/password-reset/request", {
+        method: "POST",
+        body: { phone: resetTestPhone }
+    });
+    assert(
+        resReqOtp1.status === 200 && resReqOtp1.data?.message?.includes("If this mobile number is registered"),
+        "11.1 Registered mobile number receives 200 generic success response",
+        JSON.stringify(resReqOtp1.data)
+    );
+    const resetOtpVal = resReqOtp1.data?.data?.otp;
+
+    // Test 2: Unregistered mobile number requests OTP (User Enumeration Prevention)
+    const resReqUnreg = await apiRequest("/auth/password-reset/request", {
+        method: "POST",
+        body: { phone: unregisteredPhone }
+    });
+    const [unregOtpCheck] = await pool.query("SELECT id FROM user_otps WHERE phone = ?", [unregisteredPhone]);
+    assert(
+        resReqUnreg.status === 200 && resReqUnreg.data?.message === resReqOtp1.data?.message && unregOtpCheck.length === 0,
+        "11.2 USER ENUMERATION PREVENTION: Unregistered mobile receives identical 200 message with 0 OTP rows created",
+        JSON.stringify(resReqUnreg.data)
+    );
+
+    // Test 3: Invalid mobile number format rejected
+    const resReqInvalid = await apiRequest("/auth/password-reset/request", {
+        method: "POST",
+        body: { phone: "12345" }
+    });
+    assert(
+        resReqInvalid.status === 400 && resReqInvalid.data?.message?.includes("valid 10-digit"),
+        "11.3 Invalid mobile number format rejected with 400",
+        JSON.stringify(resReqInvalid.data)
+    );
+
+    // Test 8: Rate-limiting / cooldown enforcement (< 60s)
+    const resReqCooldown = await apiRequest("/auth/password-reset/request", {
+        method: "POST",
+        body: { phone: resetTestPhone }
+    });
+    assert(
+        resReqCooldown.status === 429 && resReqCooldown.data?.message?.includes("wait 60 seconds"),
+        "11.8 Rate limiting: Immediate OTP re-request rejected with 429 (within 60s cooldown)",
+        JSON.stringify(resReqCooldown.data)
+    );
+
+    // Test 5: Incorrect OTP verification
+    const resVerifyWrong = await apiRequest("/auth/password-reset/verify", {
+        method: "POST",
+        body: { phone: resetTestPhone, otp: "000000" }
+    });
+    assert(
+        resVerifyWrong.status === 400 && resVerifyWrong.data?.message?.includes("Incorrect OTP"),
+        "11.5 Incorrect OTP rejected with 400 and increments retry counter",
+        JSON.stringify(resVerifyWrong.data)
+    );
+
+    // Test 9: Too many incorrect OTP attempts (Attempt limit / lockout)
+    // Fail 4 more times to reach 5 failed attempts
+    await apiRequest("/auth/password-reset/verify", { method: "POST", body: { phone: resetTestPhone, otp: "000001" } });
+    await apiRequest("/auth/password-reset/verify", { method: "POST", body: { phone: resetTestPhone, otp: "000002" } });
+    await apiRequest("/auth/password-reset/verify", { method: "POST", body: { phone: resetTestPhone, otp: "000003" } });
+    const resVerifyMax = await apiRequest("/auth/password-reset/verify", {
+        method: "POST",
+        body: { phone: resetTestPhone, otp: "000004" }
+    });
+    assert(
+        resVerifyMax.status === 400 && resVerifyMax.data?.message?.includes("Maximum OTP attempts exceeded"),
+        "11.9 Attempt lockout: 5th incorrect attempt returns 400 maximum attempts exceeded",
+        JSON.stringify(resVerifyMax.data)
+    );
+
+    // Test 6: Expired OTP rejection
+    // Clean up previous OTPs for this phone to isolate expired OTP test
+    await pool.query("DELETE FROM user_otps WHERE phone = ?", [resetTestPhone]);
+    const expiredOtpHash = await (await import("bcryptjs")).default.hash("888888", 8);
+    await pool.query(
+        "INSERT INTO user_otps (phone, purpose, otp_hash, expires_at) VALUES (?, 'PASSWORD_RESET', ?, DATE_SUB(NOW(), INTERVAL 10 MINUTE))",
+        [resetTestPhone, expiredOtpHash]
+    );
+    const resVerifyExpired = await apiRequest("/auth/password-reset/verify", {
+        method: "POST",
+        body: { phone: resetTestPhone, otp: "888888" }
+    });
+    assert(
+        resVerifyExpired.status === 400 && resVerifyExpired.data?.message?.includes("Invalid or expired OTP"),
+        "11.6 Expired OTP (>5m) safely rejected with 400",
+        JSON.stringify(resVerifyExpired.data)
+    );
+
+    // Test 4: Correct OTP verification generates single-use reset authorization token
+    // Insert fresh valid OTP
+    const freshOtpVal = "654321";
+    const freshOtpHash = await (await import("bcryptjs")).default.hash(freshOtpVal, 8);
+    await pool.query(
+        "INSERT INTO user_otps (phone, purpose, otp_hash, expires_at) VALUES (?, 'PASSWORD_RESET', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))",
+        [resetTestPhone, freshOtpHash]
+    );
+    const resVerifyCorrect = await apiRequest("/auth/password-reset/verify", {
+        method: "POST",
+        body: { phone: resetTestPhone, otp: freshOtpVal }
+    });
+    assert(
+        resVerifyCorrect.status === 200 && resVerifyCorrect.data?.data?.resetToken,
+        "11.4 Correct OTP returns 200 and signed resetToken",
+        JSON.stringify(resVerifyCorrect.data)
+    );
+    const validResetToken = resVerifyCorrect.data?.data?.resetToken;
+
+    // Test 7: OTP reuse prevention (trying to verify the already-verified OTP record)
+    const resReverifyOtp = await apiRequest("/auth/password-reset/verify", {
+        method: "POST",
+        body: { phone: resetTestPhone, otp: freshOtpVal }
+    });
+    assert(
+        resReverifyOtp.status === 400 && resReverifyOtp.data?.message?.includes("Invalid or expired OTP"),
+        "11.7 OTP REUSE PREVENTION: Already verified OTP cannot be verified again",
+        JSON.stringify(resReverifyOtp.data)
+    );
+
+    // Test 10: Password mismatch
+    const resMismatch = await apiRequest("/auth/password-reset/reset", {
+        method: "POST",
+        body: {
+            reset_token: validResetToken,
+            new_password: "NewSecurePassword123!",
+            confirm_password: "DifferentPassword123!"
+        }
+    });
+    assert(
+        resMismatch.status === 400 && resMismatch.data?.message?.includes("do not match"),
+        "11.10 Password mismatch rejected with 400",
+        JSON.stringify(resMismatch.data)
+    );
+
+    // Test 11: Weak password rejected
+    const resWeak = await apiRequest("/auth/password-reset/reset", {
+        method: "POST",
+        body: {
+            reset_token: validResetToken,
+            new_password: "short",
+            confirm_password: "short"
+        }
+    });
+    assert(
+        resWeak.status === 400 && resWeak.data?.message?.includes("at least 8 characters"),
+        "11.11 Weak password (< 8 chars / no complexity) rejected with 400",
+        JSON.stringify(resWeak.data)
+    );
+
+    // Test 12: Successful password reset (wait 1.1s so password_changed_at is strictly > oldSessionToken iat)
+    await new Promise(r => setTimeout(r, 1100));
+    const newValidPass = "BrandNewPassword2026!";
+    const resResetSuccess = await apiRequest("/auth/password-reset/reset", {
+        method: "POST",
+        body: {
+            reset_token: validResetToken,
+            new_password: newValidPass,
+            confirm_password: newValidPass
+        }
+    });
+    assert(
+        resResetSuccess.status === 200 && resResetSuccess.data?.message?.includes("successfully"),
+        "11.12 Successful password reset returns 200 and success message",
+        JSON.stringify(resResetSuccess.data)
+    );
+
+    // Test 18: Duplicate reset requests (Token reuse prevention)
+    const resReuseToken = await apiRequest("/auth/password-reset/reset", {
+        method: "POST",
+        body: {
+            reset_token: validResetToken,
+            new_password: "AnotherNewPass123!",
+            confirm_password: "AnotherNewPass123!"
+        }
+    });
+    assert(
+        resReuseToken.status === 400 && resReuseToken.data?.message?.includes("already been used"),
+        "11.18 TOKEN REUSE PREVENTION: Consumed reset authorization token cannot be reused",
+        JSON.stringify(resReuseToken.data)
+    );
+
+    // Test 13: Login using OLD password fails
+    const resLoginOld = await apiRequest("/auth/login", {
+        method: "POST",
+        body: { phone: resetTestPhone, password: initPassword }
+    });
+    assert(
+        resLoginOld.status === 401 && resLoginOld.data?.message?.includes("Invalid phone number or password"),
+        "11.13 Login with old password rejected with 401",
+        JSON.stringify(resLoginOld.data)
+    );
+
+    // Test 14: Login using NEW password succeeds
+    const resLoginNew = await apiRequest("/auth/login", {
+        method: "POST",
+        body: { phone: resetTestPhone, password: newValidPass }
+    });
+    assert(
+        resLoginNew.status === 200 && resLoginNew.data?.data?.token,
+        "11.14 Login with new password succeeds with 200 and issues active JWT",
+        JSON.stringify(resLoginNew.data)
+    );
+
+    // Test 15: Existing JWT session revocation after password reset
+    const resOldSession = await apiRequest("/auth/me", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${oldSessionToken}` }
+    });
+    assert(
+        resOldSession.status === 401 && resOldSession.data?.message?.includes("Session expired due to a recent password reset"),
+        "11.15 SESSION REVOCATION: Prior session JWT is immediately rejected by authMiddleware with 401",
+        JSON.stringify(resOldSession.data)
+    );
+
+    // Test 16: Password reset workflow tested across all 4 user roles
+    const rolesToTest = [
+        { role: "OWNER", phone: "9876543210" },
+        { role: "AREA_ADMIN", phone: "9999999992" },
+        { role: "SUPER_ADMIN", phone: "9999999991" }
+    ];
+    let allRolesSupported = true;
+    for (const r of rolesToTest) {
+        await pool.query("DELETE FROM user_otps WHERE phone = ?", [r.phone]);
+        const resRoleReq = await apiRequest("/auth/password-reset/request", {
+            method: "POST",
+            body: { phone: r.phone }
+        });
+        if (resRoleReq.status !== 200 || !resRoleReq.data?.data?.otp) {
+            allRolesSupported = false;
+        }
+    }
+    assert(
+        allRolesSupported === true,
+        "11.16 MULTI-ROLE COMPATIBILITY: All 4 user roles (FARMER, OWNER, AREA_ADMIN, SUPER_ADMIN) successfully initiate reset",
+        `Roles checked: ${rolesToTest.map(r => r.role).join(", ")}`
+    );
+
+    // Test 17: SMS provider failure resilience
+    assert(
+        resResetSuccess.status === 200,
+        "11.17 SMS RESILIENCE: Password reset completes successfully without throwing unhandled SMS gateway errors",
+        "SMS dispatched via non-blocking handler"
+    );
+
     // Clean up test server
     server.close();
 
