@@ -9,6 +9,8 @@ import bookingRoutes from "./routes/bookingRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
 import inspectionRoutes from "./routes/inspectionRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
+import locationRoutes from "./routes/locationRoutes.js";
+import userManagementRoutes from "./routes/userManagementRoutes.js";
 import {
     checkBookingAcceptanceTimeouts,
     checkPaymentVerificationTimeouts
@@ -30,6 +32,8 @@ app.use("/api", bookingRoutes);
 app.use("/api", adminRoutes);
 app.use("/api", inspectionRoutes);
 app.use("/api", authRoutes);
+app.use("/api", locationRoutes);
+app.use("/api", userManagementRoutes);
 
 const server = app.listen(0);
 const port = server.address().port;
@@ -86,7 +90,7 @@ async function runTests() {
     let owner2UserId, owner2Id;
     if (existingOwner2.length === 0) {
         const [uRes] = await pool.query(
-            "INSERT INTO users (full_name, phone, password_hash, role, status) VALUES ('Owner Two', '9999999998', 'dummy', 'OWNER', 'ACTIVE')"
+            "INSERT INTO users (full_name, phone, email, password_hash, role, status) VALUES ('Owner Two', '9999999998', 'owner2@test.com', 'dummy', 'OWNER', 'ACTIVE')"
         );
         owner2UserId = uRes.insertId;
         const [oRes] = await pool.query(
@@ -1481,12 +1485,17 @@ async function runTests() {
         }
     });
     assert(
-        resRegFarmer.status === 201 && resRegFarmer.data?.data?.status === "PENDING",
-        "Farmer registration returns 201 with status PENDING",
+        resRegFarmer.status === 201 && resRegFarmer.data?.data?.status === "PENDING" && resRegFarmer.data?.data?.otp === undefined,
+        "Farmer registration returns 201 with status PENDING and zero OTP leak in HTTP response",
         JSON.stringify(resRegFarmer.data)
     );
     const regFarmerUserId = resRegFarmer.data?.data?.userId;
-    const regFarmerOtp = resRegFarmer.data?.data?.otp;
+    const regFarmerOtp = getLastEmailFor("ramesh.farmer@example.com")?.templateData?.otp;
+    assert(
+        Boolean(regFarmerOtp && String(regFarmerOtp).length === 6),
+        "Registration OTP dispatched cleanly via Brevo email service",
+        `Extracted email OTP: ${regFarmerOtp ? "present" : "missing"}`
+    );
 
     const [chkFarmerProfile] = await pool.query("SELECT * FROM farmers WHERE user_id = ?", [regFarmerUserId]);
     assert(
@@ -1597,7 +1606,7 @@ async function runTests() {
         }
     });
     assert(
-        resLoginPending.status === 403 && resLoginPending.data?.message?.includes("pending mobile OTP verification"),
+        resLoginPending.status === 403 && resLoginPending.data?.message?.includes("pending email OTP verification"),
         "Login for unverified PENDING account safely rejected with 403",
         JSON.stringify(resLoginPending.data)
     );
@@ -1790,11 +1799,16 @@ async function runTests() {
         body: { phone: resetTestPhone }
     });
     assert(
-        resReqOtp1.status === 200 && resReqOtp1.data?.message?.includes("If this") && resReqOtp1.data?.message?.includes("registered"),
-        "11.1 Registered identifier receives 200 generic success response",
+        resReqOtp1.status === 200 && resReqOtp1.data?.message?.includes("If this") && resReqOtp1.data?.message?.includes("registered") && resReqOtp1.data?.data?.otp === undefined,
+        "11.1 Registered identifier receives 200 generic success response with zero OTP leak",
         JSON.stringify(resReqOtp1.data)
     );
-    const resetOtpVal = resReqOtp1.data?.data?.otp;
+    const resetOtpVal = getLastEmailFor("reset@test.com")?.templateData?.otp;
+    assert(
+        Boolean(resetOtpVal && String(resetOtpVal).length === 6),
+        "11.1b Password reset OTP dispatched cleanly via email",
+        `Extracted reset email OTP: ${resetOtpVal ? "present" : "missing"}`
+    );
 
     // Test 2: Unregistered mobile number requests OTP (User Enumeration Prevention)
     const resReqUnreg = await apiRequest("/auth/password-reset/request", {
@@ -2012,7 +2026,11 @@ async function runTests() {
             method: "POST",
             body: { phone: r.phone }
         });
-        if (resRoleReq.status !== 200 || !resRoleReq.data?.data?.otp) {
+        const [otpDbRows] = await pool.query(
+            "SELECT id FROM user_otps WHERE phone = ? AND purpose = 'PASSWORD_RESET' AND is_used = FALSE LIMIT 1",
+            [r.phone]
+        );
+        if (resRoleReq.status !== 200 || resRoleReq.data?.data?.otp !== undefined || otpDbRows.length === 0) {
             allRolesSupported = false;
         }
     }
@@ -2175,6 +2193,331 @@ async function runTests() {
         "12.9 BREVO AUDIT TRAIL: In-memory sent email audit store active and recorded all transactional dispatches",
         `Total emails tracked in session: ${allSentEmails.length}`
     );
+
+    // -------------------------------------------------------------------------
+    // 13. MODULE 1: AUTH SECURITY, PROFILE, LOGOUT, LOCATIONS & USER MANAGEMENT
+    // -------------------------------------------------------------------------
+    console.log("\n--- 13. MODULE 1: AUTH SECURITY, PROFILE, LOGOUT, LOCATIONS & USER MANAGEMENT ---");
+
+    // Clean any leftover Module 1 temporary records
+    await pool.query("DELETE FROM user_otps WHERE phone IN ('9666666661', '9666666662')");
+    await pool.query("DELETE FROM area_admins WHERE user_id IN (SELECT id FROM users WHERE phone = '9666666662')");
+    await pool.query("DELETE FROM farmers WHERE user_id IN (SELECT id FROM users WHERE phone = '9666666661')");
+    await pool.query("DELETE FROM users WHERE phone IN ('9666666661', '9666666662')");
+    await pool.query("DELETE FROM locations WHERE district = 'Mod1TestDistrict'");
+
+    // 13.1 Owner registration requires valid location_id
+    const resOwnerNoLoc = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "Missing Location Owner",
+            phone: "9666666669",
+            email: "noloc.owner@example.com",
+            password: "OwnerPassword123",
+            role: "OWNER"
+        }
+    });
+    assert(
+        resOwnerNoLoc.status === 400 && resOwnerNoLoc.data?.message?.includes("location_id"),
+        "13.1a OWNER registration without location_id returns 400",
+        JSON.stringify(resOwnerNoLoc.data)
+    );
+
+    const resOwnerBadLoc = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "Nonexistent Location Owner",
+            phone: "9666666668",
+            email: "badloc.owner@example.com",
+            password: "OwnerPassword123",
+            role: "OWNER",
+            location_id: 9999999
+        }
+    });
+    assert(
+        resOwnerBadLoc.status === 404,
+        "13.1b OWNER registration with nonexistent location_id returns 404",
+        JSON.stringify(resOwnerBadLoc.data)
+    );
+
+    // 13.2 OTP Purpose Isolation: PASSWORD_RESET OTP cannot be verified via /auth/otp/verify
+    const mod1Phone = "9666666661";
+    const mod1Email = "mod1.farmer@example.com";
+    const resRegMod1 = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "Module One Farmer",
+            phone: mod1Phone,
+            email: mod1Email,
+            password: "Mod1Password123",
+            role: "FARMER",
+            location_id: 1,
+            address: "Original Address"
+        }
+    });
+    const mod1RegOtp = getLastEmailFor(mod1Email)?.templateData?.otp;
+    await apiRequest("/auth/otp/verify", {
+        method: "POST",
+        body: { phone: mod1Phone, otp: mod1RegOtp }
+    });
+
+    await pool.query("DELETE FROM user_otps WHERE phone = ?", [mod1Phone]);
+    await apiRequest("/auth/password-reset/request", {
+        method: "POST",
+        body: { email: mod1Email }
+    });
+    const mod1ResetOtp = getLastEmailFor(mod1Email)?.templateData?.otp;
+    const resCrossPurposeOtp = await apiRequest("/auth/otp/verify", {
+        method: "POST",
+        body: { phone: mod1Phone, otp: mod1ResetOtp }
+    });
+    assert(
+        resCrossPurposeOtp.status === 400 && Boolean(mod1ResetOtp),
+        "13.2 OTP PURPOSE ISOLATION: PASSWORD_RESET OTP rejected by registration /auth/otp/verify endpoint (400)",
+        JSON.stringify(resCrossPurposeOtp.data)
+    );
+
+    // 13.3 Logout immediately revokes JWT (even within same second) while subsequent login works
+    const resMod1Login1 = await apiRequest("/auth/login", {
+        method: "POST",
+        body: { identifier: mod1Email, password: "Mod1Password123" }
+    });
+    const mod1Token1 = resMod1Login1.data?.data?.token;
+
+    await new Promise((r) => setTimeout(r, 15));
+    const resLogout = await apiRequest("/auth/logout", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${mod1Token1}` }
+    });
+    const resAfterLogout = await apiRequest("/auth/me", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${mod1Token1}` }
+    });
+    await new Promise((r) => setTimeout(r, 15));
+    const resMod1Login2 = await apiRequest("/auth/login", {
+        method: "POST",
+        body: { phone: mod1Phone, password: "Mod1Password123" }
+    });
+    const mod1Token2 = resMod1Login2.data?.data?.token;
+    const resAfterRelogin = await apiRequest("/auth/me", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${mod1Token2}` }
+    });
+    assert(
+        resLogout.status === 200 && resAfterLogout.status === 401 && resAfterRelogin.status === 200,
+        "13.3 LOGOUT REVOCATION: POST /auth/logout immediately invalidates current JWT (401) while fresh login succeeds (200)",
+        `logout=${resLogout.status}, afterLogout=${resAfterLogout.status}, afterRelogin=${resAfterRelogin.status}`
+    );
+
+    // 13.4 Profile update (PUT /api/auth/profile)
+    const resUpdateProfile = await apiRequest("/auth/profile", {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${mod1Token2}` },
+        body: {
+            full_name: "Module One Updated",
+            address: "Updated Farm Lane"
+        }
+    });
+    const resAdminLocBlock = await apiRequest("/auth/profile", {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: { location_id: 1 }
+    });
+    assert(
+        resUpdateProfile.status === 200 &&
+        resUpdateProfile.data?.data?.full_name === "Module One Updated" &&
+        resAdminLocBlock.status === 403,
+        "13.4 PROFILE UPDATE: Farmer profile updates cleanly (200) & Area Admin self-reassignment blocked (403)",
+        `update=${resUpdateProfile.status}, adminBlock=${resAdminLocBlock.status}`
+    );
+
+    // 13.5 Authenticated change password (POST /api/auth/change-password)
+    const resWrongCurrPass = await apiRequest("/auth/change-password", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${mod1Token2}` },
+        body: {
+            current_password: "WrongCurrentPassword123",
+            new_password: "Mod1StrongerPassword!23",
+            confirm_password: "Mod1StrongerPassword!23"
+        }
+    });
+    const resWeakChangePass = await apiRequest("/auth/change-password", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${mod1Token2}` },
+        body: {
+            current_password: "Mod1Password123",
+            new_password: "weakpassword",
+            confirm_password: "weakpassword"
+        }
+    });
+    await new Promise((r) => setTimeout(r, 15));
+    const resChangePassOk = await apiRequest("/auth/change-password", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${mod1Token2}` },
+        body: {
+            current_password: "Mod1Password123",
+            new_password: "Mod1StrongerPassword!23",
+            confirm_password: "Mod1StrongerPassword!23"
+        }
+    });
+    const resRevokedAfterChange = await apiRequest("/auth/me", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${mod1Token2}` }
+    });
+    const resLoginAfterChange = await apiRequest("/auth/login", {
+        method: "POST",
+        body: { phone: mod1Phone, password: "Mod1StrongerPassword!23" }
+    });
+    assert(
+        resWrongCurrPass.status === 401 &&
+        resWeakChangePass.status === 400 &&
+        resChangePassOk.status === 200 &&
+        resRevokedAfterChange.status === 401 &&
+        resLoginAfterChange.status === 200,
+        "13.5 CHANGE PASSWORD: Validates current password (401), enforces strength (400), updates hash (200), revokes old JWT (401) & enables new login (200)",
+        `wrong=${resWrongCurrPass.status}, weak=${resWeakChangePass.status}, ok=${resChangePassOk.status}, oldJwt=${resRevokedAfterChange.status}, newLogin=${resLoginAfterChange.status}`
+    );
+
+    // 13.6 Locations CRUD & RBAC
+    const resPublicLocs = await apiRequest("/locations?limit=10");
+    const resFarmerCreateLoc = await apiRequest("/locations", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: {
+            state: "TestState",
+            district: "Mod1TestDistrict",
+            mandal: "TestMandal",
+            panchayat: "TestPanchayat",
+            village: "TestVillage"
+        }
+    });
+    const resSuperCreateLoc = await apiRequest("/locations", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: {
+            state: "TestState",
+            district: "Mod1TestDistrict",
+            mandal: "TestMandal",
+            panchayat: "TestPanchayat",
+            village: "TestVillage"
+        }
+    });
+    const createdLocId = resSuperCreateLoc.data?.data?.id;
+    const resDupLoc = await apiRequest("/locations", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: {
+            state: "teststate",
+            district: "mod1testdistrict",
+            mandal: "testmandal",
+            panchayat: "testpanchayat",
+            village: "testvillage"
+        }
+    });
+    const resUpdateLoc = await apiRequest(`/locations/${createdLocId}`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { village: "UpdatedVillage" }
+    });
+    const resDeleteInUseLoc = await apiRequest("/locations/1", {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    assert(
+        resPublicLocs.status === 200 &&
+        Array.isArray(resPublicLocs.data?.data) &&
+        resFarmerCreateLoc.status === 403 &&
+        resSuperCreateLoc.status === 201 &&
+        resDupLoc.status === 409 &&
+        resUpdateLoc.status === 200 &&
+        resUpdateLoc.data?.data?.village === "UpdatedVillage" &&
+        resDeleteInUseLoc.status === 409,
+        "13.6 LOCATIONS CRUD & RBAC: Public list (200), non-admin blocked (403), Super Admin create (201), duplicate blocked (409), update (200), in-use delete blocked (409)",
+        `list=${resPublicLocs.status}, farmer=${resFarmerCreateLoc.status}, create=${resSuperCreateLoc.status}, dup=${resDupLoc.status}, upd=${resUpdateLoc.status}, delInUse=${resDeleteInUseLoc.status}`
+    );
+
+    // 13.7 Area Admin & User Management API
+    const mod1AaPhone = "9666666662";
+    const resFarmerCreateAa = await apiRequest("/admin/super/area-admins", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: {
+            full_name: "Unauthorized AA",
+            phone: mod1AaPhone,
+            email: "mod1.aa@example.com",
+            password: "AreaAdminPassword123",
+            location_id: createdLocId
+        }
+    });
+    const resSuperCreateAa = await apiRequest("/admin/super/area-admins", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: {
+            full_name: "Module One Area Admin",
+            phone: mod1AaPhone,
+            email: "mod1.aa@example.com",
+            password: "AreaAdminPassword123",
+            location_id: createdLocId
+        }
+    });
+    const createdAaId = resSuperCreateAa.data?.data?.areaAdminId;
+    const resListAas = await apiRequest("/admin/super/area-admins", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    const resReassignAa = await apiRequest(`/admin/super/area-admins/${createdAaId}/location`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { location_id: 1 }
+    });
+    const resListUsersSuper = await apiRequest("/admin/super/users?role=FARMER&limit=10", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    const resListUsersArea = await apiRequest("/admin/super/users", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${areaAdminToken}` }
+    });
+    const resSearchFarmersAa = await apiRequest("/admin/farmers/search?q=Far", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${areaAdminToken}` }
+    });
+    const resSearchFarmersSuper = await apiRequest("/admin/farmers/search?q=Far", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    const resSearchFarmersDenied = await apiRequest("/admin/farmers/search?q=a", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    const aaIncludesOutsideFarFarmer = (resSearchFarmersAa.data?.data || []).some((f) => f.location_id === 999);
+    const resDeleteUnusedLoc = await apiRequest(`/locations/${createdLocId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+
+    assert(
+        resFarmerCreateAa.status === 403 &&
+        resSuperCreateAa.status === 201 &&
+        resListAas.status === 200 &&
+        resReassignAa.status === 200 &&
+        resListUsersSuper.status === 200 &&
+        resListUsersArea.status === 403 &&
+        resSearchFarmersAa.status === 200 &&
+        !aaIncludesOutsideFarFarmer &&
+        resSearchFarmersSuper.status === 200 &&
+        resSearchFarmersDenied.status === 403 &&
+        resDeleteUnusedLoc.status === 200,
+        "13.7 USER & AREA ADMIN MANAGEMENT: Area Admin create/list/reassign, Super Admin users list, area-scoped farmer search & unreferenced location delete all pass",
+        `aaCreate=${resSuperCreateAa.status}, aaList=${resListAas.status}, reassign=${resReassignAa.status}, usersSuper=${resListUsersSuper.status}, usersAa=${resListUsersArea.status}, searchAa=${resSearchFarmersAa.status}, outsideLeaked=${aaIncludesOutsideFarFarmer}, delLoc=${resDeleteUnusedLoc.status}`
+    );
+
+    // Clean up temporary Module 1 test records
+    await pool.query("DELETE FROM user_otps WHERE phone IN (?, ?)", [mod1Phone, mod1AaPhone]);
+    await pool.query("DELETE FROM area_admins WHERE user_id IN (SELECT id FROM users WHERE phone = ?)", [mod1AaPhone]);
+    await pool.query("DELETE FROM farmers WHERE user_id IN (SELECT id FROM users WHERE phone = ?)", [mod1Phone]);
+    await pool.query("DELETE FROM users WHERE phone IN (?, ?)", [mod1Phone, mod1AaPhone]);
+    await pool.query("DELETE FROM locations WHERE district = 'Mod1TestDistrict'");
 
     // Clean up test server
     server.close();

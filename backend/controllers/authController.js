@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pool from "../db.js";
@@ -8,8 +9,25 @@ import {
     sendPasswordResetSuccessEmail
 } from "../services/notificationService.js";
 import { isValidEmail } from "../services/emailService.js";
+import { parsePositiveInt } from "../utils/responseHelper.js";
 
 const PHONE_REGEX = /^[6-9]\d{9}$/;
+const REGISTER_PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/;
+const STRONG_PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]).{8,}$/;
+
+const generateSecureOTP = () => crypto.randomInt(100000, 1000000).toString();
+
+const signAuthToken = (user) => {
+    const secret = process.env.JWT_SECRET;
+    if (!secret) {
+        throw new Error("JWT_SECRET is not configured");
+    }
+    return jwt.sign(
+        { id: user.id, role: user.role, issuedAtMs: Date.now() },
+        secret,
+        { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
+    );
+};
 
 /**
  * Register a new user (FARMER or OWNER)
@@ -28,7 +46,15 @@ export const register = async (req, res) => {
             });
         }
 
-        const trimmedPhone = phone.trim();
+        const trimmedName = String(full_name).trim();
+        if (trimmedName.length < 2 || trimmedName.length > 100) {
+            return res.status(400).json({
+                success: false,
+                message: "Full name must be between 2 and 100 characters"
+            });
+        }
+
+        const trimmedPhone = String(phone).trim();
         if (!PHONE_REGEX.test(trimmedPhone)) {
             return res.status(400).json({
                 success: false,
@@ -36,7 +62,7 @@ export const register = async (req, res) => {
             });
         }
 
-        const trimmedEmail = email.trim().toLowerCase();
+        const trimmedEmail = String(email).trim().toLowerCase();
         if (!isValidEmail(trimmedEmail)) {
             return res.status(400).json({
                 success: false,
@@ -45,7 +71,7 @@ export const register = async (req, res) => {
         }
 
         const validRoles = ["FARMER", "OWNER"];
-        const upperRole = role.toUpperCase();
+        const upperRole = String(role).trim().toUpperCase();
         if (!validRoles.includes(upperRole)) {
             return res.status(400).json({
                 success: false,
@@ -53,11 +79,43 @@ export const register = async (req, res) => {
             });
         }
 
-        if (password.length < 6) {
+        if (typeof password !== "string" || !REGISTER_PASSWORD_REGEX.test(password)) {
             return res.status(400).json({
                 success: false,
-                message: "Password must be at least 6 characters long"
+                message: "Password must be at least 8 characters long and include uppercase, lowercase, and a number"
             });
+        }
+
+        let validatedLocationId = null;
+        if (upperRole === "OWNER") {
+            validatedLocationId = parsePositiveInt(location_id);
+            if (!validatedLocationId) {
+                return res.status(400).json({
+                    success: false,
+                    message: "A valid location_id is required for OWNER registration"
+                });
+            }
+        } else if (location_id !== undefined && location_id !== null && location_id !== "") {
+            validatedLocationId = parsePositiveInt(location_id);
+            if (!validatedLocationId) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid location_id"
+                });
+            }
+        }
+
+        if (validatedLocationId) {
+            const [locRows] = await connection.query(
+                "SELECT id FROM locations WHERE id = ?",
+                [validatedLocationId]
+            );
+            if (locRows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Selected location not found"
+                });
+            }
         }
 
         // 2. Check duplicate phone or email
@@ -83,7 +141,7 @@ export const register = async (req, res) => {
         const [userResult] = await connection.query(
             `INSERT INTO users (full_name, phone, email, password_hash, role, status)
              VALUES (?, ?, ?, ?, ?, 'PENDING')`,
-            [full_name.trim(), trimmedPhone, trimmedEmail, passwordHash, upperRole]
+            [trimmedName, trimmedPhone, trimmedEmail, passwordHash, upperRole]
         );
         const userId = userResult.insertId;
 
@@ -92,21 +150,27 @@ export const register = async (req, res) => {
             await connection.query(
                 `INSERT INTO farmers (user_id, location_id, address)
                  VALUES (?, ?, ?)`,
-                [userId, location_id || null, address ? address.trim() : null]
+                [userId, validatedLocationId, address ? String(address).trim() : null]
             );
         } else if (upperRole === "OWNER") {
             await connection.query(
                 `INSERT INTO owners (user_id, location_id, verification_status)
                  VALUES (?, ?, 'PENDING')`,
-                [userId, location_id || null]
+                [userId, validatedLocationId]
             );
         }
 
-        // 6. Generate 6-digit OTP
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        // 6. Generate cryptographically secure 6-digit OTP and invalidate prior unverified registration OTPs
+        const otp = generateSecureOTP();
         const otpHash = await bcrypt.hash(otp, 8);
 
-        // Store OTP with 5-minute expiry
+        await connection.query(
+            `UPDATE user_otps
+             SET is_used = TRUE
+             WHERE (phone = ? OR email = ?) AND purpose = 'REGISTRATION' AND is_verified = FALSE AND is_used = FALSE`,
+            [trimmedPhone, trimmedEmail]
+        );
+
         await connection.query(
             `INSERT INTO user_otps (phone, email, purpose, otp_hash, expires_at)
              VALUES (?, ?, 'REGISTRATION', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
@@ -115,8 +179,8 @@ export const register = async (req, res) => {
 
         await connection.commit();
 
-        // 7. Send OTP via Brevo Email
-        sendOTPEmail({ email: trimmedEmail, name: full_name.trim(), otp }).catch(err =>
+        // 7. Send OTP via Brevo Email (non-blocking)
+        sendOTPEmail({ email: trimmedEmail, name: trimmedName, otp }).catch((err) =>
             console.error("Register OTP Email error:", err)
         );
 
@@ -128,15 +192,17 @@ export const register = async (req, res) => {
                 phone: trimmedPhone,
                 email: trimmedEmail,
                 role: upperRole,
-                status: "PENDING",
-                // Exposed for test verification in non-production
-                otp: process.env.NODE_ENV === "production" ? undefined : otp
+                locationId: validatedLocationId,
+                status: "PENDING"
             }
         });
-
     } catch (error) {
-        await connection.rollback();
-        console.error("User registration error:", error);
+        try {
+            await connection.rollback();
+        } catch {
+            // ignore if transaction not started
+        }
+        console.error("User registration error:", error.message || error);
         return res.status(500).json({
             success: false,
             message: "Failed to register user"
@@ -147,13 +213,13 @@ export const register = async (req, res) => {
 };
 
 /**
- * Dispatch OTP for login or registration verification
+ * Dispatch OTP for registration verification
  * Route: POST /api/auth/otp/send
  */
 export const sendOTP = async (req, res) => {
     try {
         const { phone, email, identifier } = req.body;
-        const target = (identifier || email || phone || "").trim();
+        const target = String(identifier || email || phone || "").trim();
 
         if (!target) {
             return res.status(400).json({
@@ -172,12 +238,16 @@ export const sendOTP = async (req, res) => {
             });
         }
 
-        // Rate limit: check if an unexpired OTP was sent within the last 60 seconds
+        const normalizedTarget = isEmail ? target.toLowerCase() : target;
+
+        // Rate limit: check if an OTP was sent within the last 60 seconds
         const [recentOtps] = await pool.query(
             `SELECT id FROM user_otps
-             WHERE (phone = ? OR email = ?) AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)
+             WHERE (phone = ? OR email = ?)
+               AND purpose = 'REGISTRATION'
+               AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)
              LIMIT 1`,
-            [target, target]
+            [normalizedTarget, normalizedTarget]
         );
 
         if (recentOtps.length > 0) {
@@ -189,16 +259,23 @@ export const sendOTP = async (req, res) => {
 
         // Fetch user info if registered
         const [users] = await pool.query(
-            "SELECT id, full_name, phone, email FROM users WHERE phone = ? OR email = ?",
-            [target, target]
+            "SELECT id, full_name, phone, email, status FROM users WHERE phone = ? OR email = ?",
+            [normalizedTarget, normalizedTarget]
         );
 
-        const targetEmail = users.length > 0 ? users[0].email : (isEmail ? target : null);
-        const targetPhone = users.length > 0 ? users[0].phone : (isPhone ? target : null);
+        const targetEmail = users.length > 0 ? users[0].email : (isEmail ? normalizedTarget : null);
+        const targetPhone = users.length > 0 ? users[0].phone : (isPhone ? normalizedTarget : null);
         const targetName = users.length > 0 ? users[0].full_name : "AgriRent User";
 
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const otp = generateSecureOTP();
         const otpHash = await bcrypt.hash(otp, 8);
+
+        await pool.query(
+            `UPDATE user_otps
+             SET is_used = TRUE
+             WHERE (phone = ? OR email = ?) AND purpose = 'REGISTRATION' AND is_verified = FALSE AND is_used = FALSE`,
+            [targetPhone, targetEmail]
+        );
 
         await pool.query(
             `INSERT INTO user_otps (phone, email, purpose, otp_hash, expires_at)
@@ -207,7 +284,7 @@ export const sendOTP = async (req, res) => {
         );
 
         if (targetEmail) {
-            sendOTPEmail({ email: targetEmail, name: targetName, otp }).catch(err =>
+            sendOTPEmail({ email: targetEmail, name: targetName, otp }).catch((err) =>
                 console.error("Send OTP Email error:", err)
             );
         }
@@ -216,16 +293,14 @@ export const sendOTP = async (req, res) => {
             success: true,
             message: targetEmail
                 ? `OTP sent successfully to registered email ${targetEmail}`
-                : `OTP generated successfully`,
+                : "OTP generated successfully",
             data: {
                 phone: targetPhone,
-                email: targetEmail,
-                otp: process.env.NODE_ENV === "production" ? undefined : otp
+                email: targetEmail
             }
         });
-
     } catch (error) {
-        console.error("Send OTP error:", error);
+        console.error("Send OTP error:", error.message || error);
         return res.status(500).json({
             success: false,
             message: "Failed to send OTP"
@@ -234,28 +309,33 @@ export const sendOTP = async (req, res) => {
 };
 
 /**
- * Verify OTP and activate account or authenticate
+ * Verify REGISTRATION OTP and activate account
  * Route: POST /api/auth/otp/verify
  */
 export const verifyOTP = async (req, res) => {
     try {
         const { phone, email, identifier, otp } = req.body;
-        const target = (identifier || email || phone || "").trim();
+        const targetRaw = String(identifier || email || phone || "").trim();
 
-        if (!target || !otp) {
+        if (!targetRaw || !otp) {
             return res.status(400).json({
                 success: false,
                 message: "Identifier (mobile/email) and OTP are required"
             });
         }
 
-        const trimmedOtp = otp.trim();
+        const target = isValidEmail(targetRaw) ? targetRaw.toLowerCase() : targetRaw;
+        const trimmedOtp = String(otp).trim();
 
-        // 1. Fetch latest active unverified OTP for this phone or email
+        // 1. Fetch latest active unverified REGISTRATION OTP
         const [otpRows] = await pool.query(
             `SELECT id, otp_hash, expires_at, attempts
              FROM user_otps
-             WHERE (phone = ? OR email = ?) AND is_verified = FALSE AND expires_at > NOW()
+             WHERE (phone = ? OR email = ?)
+               AND purpose = 'REGISTRATION'
+               AND is_verified = FALSE
+               AND is_used = FALSE
+               AND expires_at > NOW()
              ORDER BY created_at DESC
              LIMIT 1`,
             [target, target]
@@ -272,6 +352,7 @@ export const verifyOTP = async (req, res) => {
 
         // 2. Check retry limits (max 5 attempts)
         if (otpRecord.attempts >= 5) {
+            await pool.query("UPDATE user_otps SET is_used = TRUE WHERE id = ?", [otpRecord.id]);
             return res.status(400).json({
                 success: false,
                 message: "Maximum OTP attempts exceeded. Please request a new OTP."
@@ -281,9 +362,11 @@ export const verifyOTP = async (req, res) => {
         // 3. Verify OTP hash
         const isMatch = await bcrypt.compare(trimmedOtp, otpRecord.otp_hash);
         if (!isMatch) {
+            const newAttempts = otpRecord.attempts + 1;
+            const isBurned = newAttempts >= 5;
             await pool.query(
-                "UPDATE user_otps SET attempts = attempts + 1 WHERE id = ?",
-                [otpRecord.id]
+                "UPDATE user_otps SET attempts = ?, is_used = ? WHERE id = ?",
+                [newAttempts, isBurned ? 1 : 0, otpRecord.id]
             );
             return res.status(400).json({
                 success: false,
@@ -291,9 +374,9 @@ export const verifyOTP = async (req, res) => {
             });
         }
 
-        // 4. Mark OTP as verified
+        // 4. Mark OTP verified and single-use consumed
         await pool.query(
-            "UPDATE user_otps SET is_verified = TRUE WHERE id = ?",
+            "UPDATE user_otps SET is_verified = TRUE, is_used = TRUE WHERE id = ?",
             [otpRecord.id]
         );
 
@@ -318,22 +401,24 @@ export const verifyOTP = async (req, res) => {
 
         const user = users[0];
 
+        if (user.status !== "ACTIVE") {
+            return res.status(403).json({
+                success: false,
+                message: `User account is ${user.status.toLowerCase()} and cannot be signed in`
+            });
+        }
+
         // 7. Dispatch registration confirmation email (non-blocking)
         if (user.email) {
             sendRegistrationConfirmationEmail({
                 email: user.email,
                 name: user.full_name,
                 role: user.role
-            }).catch(err => console.error("Registration confirmation email error:", err));
+            }).catch((err) => console.error("Registration confirmation email error:", err));
         }
 
         // 8. Issue JWT Token
-        const secret = process.env.JWT_SECRET;
-        const token = jwt.sign(
-            { id: user.id, role: user.role },
-            secret,
-            { expiresIn: "7d" }
-        );
+        const token = signAuthToken(user);
 
         return res.status(200).json({
             success: true,
@@ -350,9 +435,8 @@ export const verifyOTP = async (req, res) => {
                 }
             }
         });
-
     } catch (error) {
-        console.error("Verify OTP error:", error);
+        console.error("Verify OTP error:", error.message || error);
         return res.status(500).json({
             success: false,
             message: "Failed to verify OTP"
@@ -367,14 +451,16 @@ export const verifyOTP = async (req, res) => {
 export const login = async (req, res) => {
     try {
         const { identifier, phone, email, password } = req.body;
-        const loginId = (identifier || phone || email || "").trim();
+        const loginRaw = String(identifier || phone || email || "").trim();
 
-        if (!loginId || !password) {
+        if (!loginRaw || !password) {
             return res.status(400).json({
                 success: false,
                 message: "Mobile number/email and password are required"
             });
         }
+
+        const loginId = isValidEmail(loginRaw) ? loginRaw.toLowerCase() : loginRaw;
 
         // 1. Fetch user by phone or email
         const [users] = await pool.query(
@@ -404,7 +490,6 @@ export const login = async (req, res) => {
 
         if (user.status === "SUSPENDED") {
             if (user.suspended_until && new Date() > new Date(user.suspended_until)) {
-                // Auto-reactivate expired suspension
                 await pool.query(
                     "UPDATE users SET status = 'ACTIVE', suspended_until = NULL, suspension_reason = NULL WHERE id = ?",
                     [user.id]
@@ -422,7 +507,14 @@ export const login = async (req, res) => {
         if (user.status === "PENDING") {
             return res.status(403).json({
                 success: false,
-                message: "Your account is pending mobile OTP verification. Please verify your mobile number."
+                message: "Your account is pending email OTP verification. Please check your email and verify your account."
+            });
+        }
+
+        if (user.status !== "ACTIVE") {
+            return res.status(403).json({
+                success: false,
+                message: "User account is not active"
             });
         }
 
@@ -436,12 +528,7 @@ export const login = async (req, res) => {
         }
 
         // 4. Issue JWT Token
-        const secret = process.env.JWT_SECRET;
-        const token = jwt.sign(
-            { id: user.id, role: user.role },
-            secret,
-            { expiresIn: "7d" }
-        );
+        const token = signAuthToken(user);
 
         // Fetch role profiles
         let profileDetails = {};
@@ -449,8 +536,8 @@ export const login = async (req, res) => {
             const [ownerRows] = await pool.query("SELECT id, location_id, verification_status FROM owners WHERE user_id = ?", [user.id]);
             if (ownerRows.length > 0) profileDetails = { ownerId: ownerRows[0].id, locationId: ownerRows[0].location_id, verificationStatus: ownerRows[0].verification_status };
         } else if (user.role === "FARMER") {
-            const [farmerRows] = await pool.query("SELECT id, location_id FROM farmers WHERE user_id = ?", [user.id]);
-            if (farmerRows.length > 0) profileDetails = { farmerId: farmerRows[0].id, locationId: farmerRows[0].location_id };
+            const [farmerRows] = await pool.query("SELECT id, location_id, address FROM farmers WHERE user_id = ?", [user.id]);
+            if (farmerRows.length > 0) profileDetails = { farmerId: farmerRows[0].id, locationId: farmerRows[0].location_id, address: farmerRows[0].address };
         } else if (user.role === "AREA_ADMIN") {
             const [adminRows] = await pool.query("SELECT id, location_id FROM area_admins WHERE user_id = ?", [user.id]);
             if (adminRows.length > 0) profileDetails = { areaAdminId: adminRows[0].id, locationId: adminRows[0].location_id };
@@ -472,12 +559,34 @@ export const login = async (req, res) => {
                 }
             }
         });
-
     } catch (error) {
-        console.error("User login error:", error);
+        console.error("User login error:", error.message || error);
         return res.status(500).json({
             success: false,
             message: "Failed to login"
+        });
+    }
+};
+
+/**
+ * Logout authenticated session and invalidate current/older JWTs
+ * Route: POST /api/auth/logout
+ */
+export const logout = async (req, res) => {
+    try {
+        await pool.query(
+            "UPDATE users SET token_invalidated_before = NOW(3) WHERE id = ?",
+            [req.user.id]
+        );
+        return res.status(200).json({
+            success: true,
+            message: "Logged out successfully"
+        });
+    } catch (error) {
+        console.error("Logout error:", error.message || error);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to logout"
         });
     }
 };
@@ -488,12 +597,212 @@ export const login = async (req, res) => {
  */
 export const getCurrentUser = async (req, res) => {
     try {
+        const user = { ...req.user };
+        if (user.role === "FARMER") {
+            const [rows] = await pool.query("SELECT address, farmer_id FROM farmers WHERE user_id = ?", [user.id]);
+            if (rows.length > 0) {
+                user.address = rows[0].address;
+                user.farmer_code = rows[0].farmer_id;
+            }
+        } else if (user.role === "OWNER") {
+            const [rows] = await pool.query("SELECT verification_status FROM owners WHERE user_id = ?", [user.id]);
+            if (rows.length > 0) {
+                user.verification_status = rows[0].verification_status;
+            }
+        }
+
         return res.status(200).json({
             success: true,
-            data: req.user
+            data: user
         });
     } catch (error) {
         return res.status(500).json({ success: false, message: "Failed to fetch user profile" });
+    }
+};
+
+/**
+ * Update current authenticated user profile (full_name, address for FARMER, location_id for FARMER/OWNER)
+ * Route: PUT /api/auth/profile
+ */
+export const updateProfile = async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        const { full_name, address, location_id } = req.body;
+
+        if (full_name === undefined && address === undefined && location_id === undefined) {
+            connection.release();
+            return res.status(400).json({
+                success: false,
+                message: "At least one updatable profile field (full_name, address, location_id) is required"
+            });
+        }
+
+        if (full_name !== undefined) {
+            const trimmed = String(full_name).trim();
+            if (trimmed.length < 2 || trimmed.length > 100) {
+                connection.release();
+                return res.status(400).json({
+                    success: false,
+                    message: "Full name must be between 2 and 100 characters"
+                });
+            }
+        }
+
+        let validatedLocId = undefined;
+        if (location_id !== undefined) {
+            if (req.user.role === "AREA_ADMIN" || req.user.role === "SUPER_ADMIN") {
+                connection.release();
+                return res.status(403).json({
+                    success: false,
+                    message: "Administrative area assignment can only be modified by Super Admin"
+                });
+            }
+            if (location_id === null && req.user.role === "OWNER") {
+                connection.release();
+                return res.status(400).json({
+                    success: false,
+                    message: "location_id cannot be null for OWNER accounts"
+                });
+            }
+            if (location_id !== null) {
+                validatedLocId = parsePositiveInt(location_id);
+                if (!validatedLocId) {
+                    connection.release();
+                    return res.status(400).json({ success: false, message: "Invalid location_id" });
+                }
+                const [locs] = await connection.query("SELECT id FROM locations WHERE id = ?", [validatedLocId]);
+                if (locs.length === 0) {
+                    connection.release();
+                    return res.status(404).json({ success: false, message: "Location not found" });
+                }
+            } else {
+                validatedLocId = null;
+            }
+        }
+
+        await connection.beginTransaction();
+
+        if (full_name !== undefined) {
+            await connection.query("UPDATE users SET full_name = ? WHERE id = ?", [String(full_name).trim(), req.user.id]);
+        }
+
+        if (req.user.role === "FARMER" && (address !== undefined || validatedLocId !== undefined)) {
+            const updates = [];
+            const params = [];
+            if (address !== undefined) {
+                updates.push("address = ?");
+                params.push(address ? String(address).trim() : null);
+            }
+            if (validatedLocId !== undefined) {
+                updates.push("location_id = ?");
+                params.push(validatedLocId);
+            }
+            if (updates.length > 0) {
+                params.push(req.user.id);
+                await connection.query(`UPDATE farmers SET ${updates.join(", ")} WHERE user_id = ?`, params);
+            }
+        } else if (req.user.role === "OWNER" && validatedLocId !== undefined) {
+            await connection.query("UPDATE owners SET location_id = ? WHERE user_id = ?", [validatedLocId, req.user.id]);
+        }
+
+        await connection.commit();
+
+        const [rows] = await connection.query(
+            "SELECT id, full_name, phone, email, role, status FROM users WHERE id = ?",
+            [req.user.id]
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Profile updated successfully",
+            data: rows[0]
+        });
+    } catch (error) {
+        try {
+            await connection.rollback();
+        } catch {
+            // ignore
+        }
+        console.error("Update profile error:", error.message || error);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to update profile"
+        });
+    } finally {
+        connection.release();
+    }
+};
+
+/**
+ * Authenticated password change
+ * Route: POST /api/auth/change-password
+ */
+export const changePassword = async (req, res) => {
+    try {
+        const { current_password, new_password, confirm_password } = req.body;
+
+        if (!current_password || !new_password || !confirm_password) {
+            return res.status(400).json({
+                success: false,
+                message: "current_password, new_password, and confirm_password are required"
+            });
+        }
+
+        if (new_password !== confirm_password) {
+            return res.status(400).json({
+                success: false,
+                message: "New password and confirm password do not match"
+            });
+        }
+
+        if (!STRONG_PASSWORD_REGEX.test(new_password)) {
+            return res.status(400).json({
+                success: false,
+                message: "Password must be at least 8 characters long and contain uppercase, lowercase, number, and special character"
+            });
+        }
+
+        const [users] = await pool.query(
+            "SELECT id, full_name, email, password_hash FROM users WHERE id = ?",
+            [req.user.id]
+        );
+        if (users.length === 0) {
+            return res.status(404).json({ success: false, message: "User not found" });
+        }
+
+        const user = users[0];
+        const isCurrentValid = await bcrypt.compare(current_password, user.password_hash);
+        if (!isCurrentValid) {
+            return res.status(401).json({
+                success: false,
+                message: "Current password is incorrect"
+            });
+        }
+
+        const newHash = await bcrypt.hash(new_password, 10);
+        await pool.query(
+            `UPDATE users
+             SET password_hash = ?,
+                 password_changed_at = NOW(3)
+             WHERE id = ?`,
+            [newHash, user.id]
+        );
+
+        sendPasswordResetSuccessEmail({
+            email: user.email,
+            name: user.full_name
+        }).catch((err) => console.error("Change password email error:", err));
+
+        return res.status(200).json({
+            success: true,
+            message: "Password updated successfully. Please log in again with your new password."
+        });
+    } catch (error) {
+        console.error("Change password error:", error.message || error);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to change password"
+        });
     }
 };
 
@@ -504,17 +813,17 @@ export const getCurrentUser = async (req, res) => {
 export const requestPasswordResetOTP = async (req, res) => {
     try {
         const { phone, email, identifier } = req.body;
-        const target = (identifier || email || phone || "").trim();
+        const targetRaw = String(identifier || email || phone || "").trim();
 
-        if (!target) {
+        if (!targetRaw) {
             return res.status(400).json({
                 success: false,
                 message: "Please enter your registered mobile number or email address"
             });
         }
 
-        const isPhone = PHONE_REGEX.test(target);
-        const isEmail = isValidEmail(target);
+        const isPhone = PHONE_REGEX.test(targetRaw);
+        const isEmail = isValidEmail(targetRaw);
 
         if (!isPhone && !isEmail) {
             return res.status(400).json({
@@ -523,7 +832,9 @@ export const requestPasswordResetOTP = async (req, res) => {
             });
         }
 
-        // 1. Rate limit: check if an unexpired OTP was sent within the last 60 seconds
+        const target = isEmail ? targetRaw.toLowerCase() : targetRaw;
+
+        // 1. Rate limit: check if an OTP was sent within the last 60 seconds
         const [recentOtps] = await pool.query(
             `SELECT id FROM user_otps
              WHERE (phone = ? OR email = ?) AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)
@@ -538,13 +849,12 @@ export const requestPasswordResetOTP = async (req, res) => {
             });
         }
 
-        // 2. Check if user exists (User Enumeration Prevention)
+        // 2. Check if user exists (User Enumeration Prevention: identical response either way)
         const [users] = await pool.query(
             "SELECT id, full_name, phone, email, status FROM users WHERE phone = ? OR email = ?",
             [target, target]
         );
 
-        // Even if user does not exist or is blocked, return identical generic response
         if (users.length === 0 || users[0].status === "BLOCKED") {
             return res.status(200).json({
                 success: true,
@@ -554,13 +864,14 @@ export const requestPasswordResetOTP = async (req, res) => {
 
         const user = users[0];
 
-        // 3. Generate secure 6-digit OTP
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        // 3. Generate cryptographically secure 6-digit OTP
+        const otp = generateSecureOTP();
         const otpHash = await bcrypt.hash(otp, 8);
 
-        // Invalidate any previous unverified password reset OTPs for this user
         await pool.query(
-            "UPDATE user_otps SET is_used = TRUE WHERE (phone = ? OR email = ?) AND purpose = 'PASSWORD_RESET' AND is_verified = FALSE",
+            `UPDATE user_otps
+             SET is_used = TRUE
+             WHERE (phone = ? OR email = ?) AND purpose = 'PASSWORD_RESET' AND is_verified = FALSE`,
             [user.phone, user.email]
         );
 
@@ -574,20 +885,14 @@ export const requestPasswordResetOTP = async (req, res) => {
             email: user.email,
             name: user.full_name,
             otp
-        }).catch(err => console.error("Password reset OTP Email error:", err));
+        }).catch((err) => console.error("Password reset OTP Email error:", err));
 
         return res.status(200).json({
             success: true,
-            message: "If this account is registered, a password reset OTP has been sent.",
-            data: {
-                phone: user.phone,
-                email: user.email,
-                otp: process.env.NODE_ENV === "production" ? undefined : otp
-            }
+            message: "If this account is registered, a password reset OTP has been sent."
         });
-
     } catch (error) {
-        console.error("Request password reset OTP error:", error);
+        console.error("Request password reset OTP error:", error.message || error);
         return res.status(500).json({
             success: false,
             message: "Failed to process password reset request"
@@ -602,22 +907,26 @@ export const requestPasswordResetOTP = async (req, res) => {
 export const verifyPasswordResetOTP = async (req, res) => {
     try {
         const { phone, email, identifier, otp } = req.body;
-        const target = (identifier || email || phone || "").trim();
+        const targetRaw = String(identifier || email || phone || "").trim();
 
-        if (!target || !otp) {
+        if (!targetRaw || !otp) {
             return res.status(400).json({
                 success: false,
                 message: "Registered mobile/email and OTP are required"
             });
         }
 
-        const trimmedOtp = otp.trim();
+        const target = isValidEmail(targetRaw) ? targetRaw.toLowerCase() : targetRaw;
+        const trimmedOtp = String(otp).trim();
 
-        // 1. Fetch latest active unverified password reset OTP
         const [otpRows] = await pool.query(
             `SELECT id, otp_hash, expires_at, attempts, phone, email
              FROM user_otps
-             WHERE (phone = ? OR email = ?) AND purpose = 'PASSWORD_RESET' AND is_verified = FALSE AND is_used = FALSE AND expires_at > NOW()
+             WHERE (phone = ? OR email = ?)
+               AND purpose = 'PASSWORD_RESET'
+               AND is_verified = FALSE
+               AND is_used = FALSE
+               AND expires_at > NOW()
              ORDER BY created_at DESC
              LIMIT 1`,
             [target, target]
@@ -632,7 +941,6 @@ export const verifyPasswordResetOTP = async (req, res) => {
 
         const otpRecord = otpRows[0];
 
-        // 2. Retry limits (max 5 attempts)
         if (otpRecord.attempts >= 5) {
             await pool.query("UPDATE user_otps SET is_used = TRUE WHERE id = ?", [otpRecord.id]);
             return res.status(400).json({
@@ -641,7 +949,6 @@ export const verifyPasswordResetOTP = async (req, res) => {
             });
         }
 
-        // 3. Verify OTP hash
         const isMatch = await bcrypt.compare(trimmedOtp, otpRecord.otp_hash);
         if (!isMatch) {
             const newAttempts = otpRecord.attempts + 1;
@@ -659,13 +966,11 @@ export const verifyPasswordResetOTP = async (req, res) => {
             });
         }
 
-        // 4. Mark OTP as verified
         await pool.query(
             "UPDATE user_otps SET is_verified = TRUE WHERE id = ?",
             [otpRecord.id]
         );
 
-        // 5. Fetch user record
         const [users] = await pool.query(
             "SELECT id, phone, email, full_name, role FROM users WHERE phone = ? OR email = ?",
             [target, target]
@@ -680,7 +985,6 @@ export const verifyPasswordResetOTP = async (req, res) => {
 
         const user = users[0];
 
-        // 6. Issue short-lived Reset Authorization Token (15m expiry)
         const secret = process.env.JWT_SECRET;
         const resetToken = jwt.sign(
             {
@@ -701,9 +1005,8 @@ export const verifyPasswordResetOTP = async (req, res) => {
                 resetToken
             }
         });
-
     } catch (error) {
-        console.error("Verify password reset OTP error:", error);
+        console.error("Verify password reset OTP error:", error.message || error);
         return res.status(500).json({
             success: false,
             message: "Failed to verify OTP"
@@ -736,10 +1039,7 @@ export const resetPassword = async (req, res) => {
             });
         }
 
-        // Strong password policy validation:
-        // Minimum 8 characters, at least 1 uppercase, 1 lowercase, 1 digit, 1 special character
-        const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]).{8,}$/;
-        if (!PASSWORD_REGEX.test(new_password)) {
+        if (!STRONG_PASSWORD_REGEX.test(new_password)) {
             connection.release();
             return res.status(400).json({
                 success: false,
@@ -747,12 +1047,11 @@ export const resetPassword = async (req, res) => {
             });
         }
 
-        // Verify Reset Authorization Token
         const secret = process.env.JWT_SECRET;
         let decoded;
         try {
             decoded = jwt.verify(reset_token, secret);
-        } catch (jwtErr) {
+        } catch {
             connection.release();
             return res.status(400).json({
                 success: false,
@@ -770,15 +1069,15 @@ export const resetPassword = async (req, res) => {
 
         await connection.beginTransaction();
 
-        // 1. Lock OTP record to prevent token reuse
+        // 1. Lock OTP record & enforce purpose + single-use
         const [otpRows] = await connection.query(
-            `SELECT id, is_verified, is_used, expires_at
+            `SELECT id, purpose, phone, email, is_verified, is_used, expires_at
              FROM user_otps
              WHERE id = ? FOR UPDATE`,
             [decoded.otpId]
         );
 
-        if (otpRows.length === 0 || !otpRows[0].is_verified) {
+        if (otpRows.length === 0 || otpRows[0].purpose !== "PASSWORD_RESET" || !otpRows[0].is_verified) {
             await connection.rollback();
             return res.status(400).json({
                 success: false,
@@ -794,7 +1093,7 @@ export const resetPassword = async (req, res) => {
             });
         }
 
-        // 2. Lock user record
+        // 2. Lock user record & verify ownership against OTP record
         const [users] = await connection.query(
             "SELECT id, phone, email, full_name, status FROM users WHERE id = ? FOR UPDATE",
             [decoded.userId]
@@ -809,6 +1108,13 @@ export const resetPassword = async (req, res) => {
         }
 
         const user = users[0];
+        if (otpRows[0].phone !== user.phone && otpRows[0].email !== user.email) {
+            await connection.rollback();
+            return res.status(400).json({
+                success: false,
+                message: "Invalid reset authorization token"
+            });
+        }
 
         if (user.status === "BLOCKED") {
             await connection.rollback();
@@ -821,16 +1127,16 @@ export const resetPassword = async (req, res) => {
         // 3. Hash new password
         const passwordHash = await bcrypt.hash(new_password, 10);
 
-        // 4. Update user password and set password_changed_at to NOW()
+        // 4. Update user password and set password_changed_at
         await connection.query(
             `UPDATE users
              SET password_hash = ?,
-                 password_changed_at = NOW()
+                 password_changed_at = NOW(3)
              WHERE id = ?`,
             [passwordHash, user.id]
         );
 
-        // 5. Invalidate the OTP authorization
+        // 5. Consume the OTP authorization
         await connection.query(
             "UPDATE user_otps SET is_used = TRUE WHERE id = ?",
             [decoded.otpId]
@@ -838,20 +1144,22 @@ export const resetPassword = async (req, res) => {
 
         await connection.commit();
 
-        // 6. Send confirmation Email (non-blocking)
         sendPasswordResetSuccessEmail({
             email: user.email,
             name: user.full_name
-        }).catch(err => console.error("Password reset success email error:", err));
+        }).catch((err) => console.error("Password reset success email error:", err));
 
         return res.status(200).json({
             success: true,
             message: "Password has been reset successfully. Please log in with your new password."
         });
-
     } catch (error) {
-        await connection.rollback();
-        console.error("Reset password error:", error);
+        try {
+            await connection.rollback();
+        } catch {
+            // ignore
+        }
+        console.error("Reset password error:", error.message || error);
         return res.status(500).json({
             success: false,
             message: "Failed to reset password"
@@ -866,9 +1174,11 @@ export default {
     sendOTP,
     verifyOTP,
     login,
+    logout,
     getCurrentUser,
+    updateProfile,
+    changePassword,
     requestPasswordResetOTP,
     verifyPasswordResetOTP,
     resetPassword
 };
-

@@ -3,6 +3,8 @@ import express from "express";
 import multer from "multer";
 import db from "./db.js";
 import authRoutes from "./routes/authRoutes.js";
+import locationRoutes from "./routes/locationRoutes.js";
+import userManagementRoutes from "./routes/userManagementRoutes.js";
 import equipmentMediaRoutes from "./routes/equipmentMediaRoutes.js";
 import equipmentRoutes from "./routes/equipmentRoutes.js";
 import equipmentCategoryRoutes from "./routes/equipmentCategoryRoutes.js";
@@ -46,10 +48,13 @@ const otpRateLimiter = createRateLimiter({
 
 app.use("/api/auth/login", authRateLimiter);
 app.use("/api/auth/register", authRateLimiter);
+app.use("/api/auth/change-password", authRateLimiter);
 app.use("/api/auth/otp", otpRateLimiter);
 app.use("/api/auth/password-reset", otpRateLimiter);
 
 app.use("/api", authRoutes);
+app.use("/api", locationRoutes);
+app.use("/api", userManagementRoutes);
 app.use("/api", equipmentMediaRoutes);
 app.use("/api", equipmentRoutes);
 app.use("/api", equipmentCategoryRoutes);
