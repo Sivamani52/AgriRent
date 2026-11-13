@@ -52,7 +52,7 @@ export const authenticateUser = async (req, res, next) => {
             });
         }
         const [users] = await pool.query(
-            "SELECT id, full_name, phone, email, role, status, suspended_until, suspension_reason, password_changed_at FROM users WHERE id = ?",
+            "SELECT id, full_name, phone, email, role, status, suspended_until, suspension_reason, password_changed_at, token_invalidated_before FROM users WHERE id = ?",
             [userId]
         );
 
@@ -65,10 +65,16 @@ export const authenticateUser = async (req, res, next) => {
 
         const user = users[0];
 
+        const tokenIssuedEpoch =
+            typeof decoded.issuedAtMs === "number"
+                ? decoded.issuedAtMs
+                : decoded.iat
+                ? decoded.iat * 1000
+                : null;
+
         // Invalidate sessions issued before recent password reset
-        if (decoded.iat && user.password_changed_at) {
+        if (tokenIssuedEpoch !== null && user.password_changed_at) {
             const passwordChangedEpoch = new Date(user.password_changed_at).getTime();
-            const tokenIssuedEpoch = decoded.iat * 1000;
             if (tokenIssuedEpoch < passwordChangedEpoch) {
                 return res.status(401).json({
                     success: false,
@@ -76,6 +82,20 @@ export const authenticateUser = async (req, res, next) => {
                 });
             }
         }
+
+        // Invalidate sessions issued before explicit logout
+        if (tokenIssuedEpoch !== null && user.token_invalidated_before) {
+            const invalidatedEpoch = new Date(user.token_invalidated_before).getTime();
+            if (tokenIssuedEpoch < invalidatedEpoch) {
+                return res.status(401).json({
+                    success: false,
+                    message: "Session has been logged out. Please log in again."
+                });
+            }
+        }
+
+        delete user.password_changed_at;
+        delete user.token_invalidated_before;
 
         // Check if temporary suspension has expired
         if (user.status === "SUSPENDED") {
