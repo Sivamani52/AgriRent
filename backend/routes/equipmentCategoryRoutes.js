@@ -1,5 +1,4 @@
 import express from "express";
-
 import {
     createEquipmentCategory,
     getEquipmentCategories,
@@ -7,41 +6,47 @@ import {
     updateEquipmentCategory,
     deleteEquipmentCategory
 } from "../controllers/equipmentCategoryController.js";
+import { authenticateUser, authorizeRoles } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
 
-// List equipment categories (supports ?status=ACTIVE|INACTIVE|ALL and ?search=...)
+// Public routes: List and view equipment categories
 router.get(
     "/equipment-categories",
     getEquipmentCategories
 );
 
-// Get equipment category by ID
 router.get(
     "/equipment-categories/:categoryId",
     getEquipmentCategoryById
 );
 
-// Create new equipment category
+// Protected routes: SUPER_ADMIN only
 router.post(
     "/equipment-categories",
+    authenticateUser,
+    authorizeRoles("SUPER_ADMIN"),
     createEquipmentCategory
 );
 
-// Update equipment category
 router.put(
     "/equipment-categories/:categoryId",
+    authenticateUser,
+    authorizeRoles("SUPER_ADMIN"),
     updateEquipmentCategory
 );
 
 router.patch(
     "/equipment-categories/:categoryId",
+    authenticateUser,
+    authorizeRoles("SUPER_ADMIN"),
     updateEquipmentCategory
 );
 
-// Delete equipment category
 router.delete(
     "/equipment-categories/:categoryId",
+    authenticateUser,
+    authorizeRoles("SUPER_ADMIN"),
     deleteEquipmentCategory
 );
 

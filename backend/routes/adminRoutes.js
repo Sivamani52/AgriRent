@@ -89,6 +89,13 @@ router.post(
     submitFinalDisputeDecision
 );
 
+router.post(
+    "/admin/super/disputes/:disputeId/decision",
+    authenticateUser,
+    authorizeRoles("SUPER_ADMIN"),
+    submitFinalDisputeDecision
+);
+
 // =========================================================================
 // SUPER ADMIN ACCOUNT ADMINISTRATION (FEATURE 5)
 // =========================================================================

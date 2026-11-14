@@ -321,6 +321,27 @@ export const sendPaymentSubmittedEmail = async ({ ownerEmail, ownerName, booking
   });
 };
 
+export const sendPaymentVerificationWarningEmail = async ({ ownerEmail, ownerName, bookingId, equipmentName, graceDeadlineHours = 12 }) => {
+  return sendEmail({
+    to: ownerEmail,
+    toName: ownerName || "Equipment Owner",
+    subject: `Urgent: Verify Advance Payment for Booking #${bookingId} - AgriRent`,
+    template: "paymentNotification.html",
+    templateData: {
+      title: "Payment Verification Grace Period Active",
+      badgeClass: "badge-warning",
+      paymentTitle: "Payment Verification Overdue",
+      paymentMessage: `The initial payment verification deadline for Booking #${bookingId} (${equipmentName || "Equipment"}) has expired. A ${graceDeadlineHours}-hour administrative grace period is now active.`,
+      bookingId,
+      equipmentName: equipmentName || "Agricultural Equipment",
+      paymentType: "20% Advance Payment",
+      amount: "N/A",
+      alertBoxClass: "warning-box",
+      actionGuidance: `Please verify or reject this payment within ${graceDeadlineHours} hours. Failure to respond will result in automatic payment rejection and booking cancellation.`
+    }
+  });
+};
+
 /**
  * Event 7: Owner verifies advance payment
  */

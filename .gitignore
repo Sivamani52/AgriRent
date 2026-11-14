@@ -1,14 +1,19 @@
-# Node dependencies
+# Dependencies
 node_modules/
-*/node_modules/
+**/node_modules/
 
-# Environment variables
+# Production and test builds
+dist/
+build/
+coverage/
+out/
+
+# Environment configurations
 .env
-.env.local
-.env.*.local
-*.env
+.env.*
+!.env.example
 
-# Logs
+# Logs and debug output
 logs/
 *.log
 npm-debug.log*
@@ -16,23 +21,21 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
+# OS-generated files
+.DS_Store
+Thumbs.db
 
-# Build & distribution directories
-dist/
-build/
-out/
-
-# Editor / IDE configuration
-.vscode/
+# IDE and Editor configurations
+.vscode/*
+!.vscode/extensions.json
 .idea/
 *.swp
 *.swo
 
-# Operating System files
-.DS_Store
-Thumbs.db
+# Caching and temporary files
+.cache/
+.temp/
+pids
+*.pid
+*.seed
+*.pid.lock

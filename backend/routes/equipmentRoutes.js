@@ -1,5 +1,4 @@
 import express from "express";
-
 import {
     updateEquipmentStatus,
     getEquipmentById,
@@ -9,7 +8,8 @@ import {
     updateEquipment,
     deleteEquipment,
     searchEquipment,
-    getEquipmentByOwner
+    getEquipmentByOwner,
+    getPendingVerificationEquipment
 } from "../controllers/equipmentController.js";
 import { authenticateUser, authorizeRoles } from "../middleware/authMiddleware.js";
 
@@ -26,12 +26,15 @@ router.get(
     getAvailableEquipment
 );
 
+// Administrative route: Pending equipment verification queue
 router.get(
-    "/equipment/:equipmentId",
-    getEquipmentById
+    "/equipment/admin/pending",
+    authenticateUser,
+    authorizeRoles("AREA_ADMIN", "SUPER_ADMIN"),
+    getPendingVerificationEquipment
 );
 
-// Protected routes
+// Protected route: Equipment belonging to an owner
 router.get(
     "/equipment/owner/:ownerId",
     authenticateUser,
@@ -39,6 +42,13 @@ router.get(
     getEquipmentByOwner
 );
 
+// Public route: Single equipment details by ID
+router.get(
+    "/equipment/:equipmentId",
+    getEquipmentById
+);
+
+// Protected routes: Equipment registration, modification, deletion
 router.post(
     "/equipment",
     authenticateUser,
@@ -69,6 +79,13 @@ router.patch(
 
 router.patch(
     "/equipment/:equipmentId/verification",
+    authenticateUser,
+    authorizeRoles("AREA_ADMIN", "SUPER_ADMIN"),
+    updateEquipmentVerification
+);
+
+router.patch(
+    "/equipment/:equipmentId/verify",
     authenticateUser,
     authorizeRoles("AREA_ADMIN", "SUPER_ADMIN"),
     updateEquipmentVerification

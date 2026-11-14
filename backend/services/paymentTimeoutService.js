@@ -3,10 +3,36 @@ import {
     sendBookingReminderEmail,
     sendBookingAutoCancelledEmail,
     sendPaymentRejectedEmail,
+    sendPaymentVerificationWarningEmail,
     sendRefundReminderEmail,
     sendAreaAdminDisputeEmail,
     sendSuperAdminEscalationEmail
 } from "./notificationService.js";
+
+/**
+ * Distributed lock utility using MySQL GET_LOCK to prevent multi-instance race conditions
+ */
+export const runWithLock = async (lockName, timeoutSeconds, fn) => {
+    const connection = await pool.getConnection();
+    let lockAcquired = false;
+    try {
+        const [lockResult] = await connection.query("SELECT GET_LOCK(?, ?) AS acquired", [lockName, timeoutSeconds]);
+        lockAcquired = lockResult[0]?.acquired === 1;
+        if (!lockAcquired) {
+            return;
+        }
+        await fn();
+    } finally {
+        if (lockAcquired) {
+            try {
+                await connection.query("SELECT RELEASE_LOCK(?)", [lockName]);
+            } catch (relErr) {
+                console.error(`[Job Runner] Error releasing lock ${lockName}:`, relErr);
+            }
+        }
+        connection.release();
+    }
+};
 
 /**
  * Checks owner booking acceptance timeouts:
@@ -195,7 +221,7 @@ export const checkBookingAcceptanceTimeouts = async () => {
  */
 export const checkPaymentVerificationTimeouts = async () => {
     try {
-        // --- 1. Owner 2-Hour Payment Verification Warning ---
+        // --- 1. Owner Payment Verification Grace Warning (12-hour grace period) ---
         const [warningPayments] = await pool.query(
             `SELECT 
                 bp.id, 
@@ -203,8 +229,10 @@ export const checkPaymentVerificationTimeouts = async () => {
                 bp.verification_deadline, 
                 bp.admin_warning_sent_at, 
                 bp.admin_grace_deadline,
+                ou.email AS owner_email,
                 ou.phone AS owner_phone,
-                ou.full_name AS owner_name
+                ou.full_name AS owner_name,
+                e.name AS equipment_name
              FROM booking_payments bp
              JOIN bookings b ON bp.booking_id = b.id
              JOIN equipment e ON b.equipment_id = e.id
@@ -216,7 +244,7 @@ export const checkPaymentVerificationTimeouts = async () => {
         );
 
         for (const payment of warningPayments) {
-            const graceDeadline = new Date(Date.now() + 2 * 60 * 60 * 1000);
+            const graceDeadline = new Date(Date.now() + 12 * 60 * 60 * 1000);
 
             const [updateResult] = await pool.query(
                 `UPDATE booking_payments 
@@ -228,8 +256,17 @@ export const checkPaymentVerificationTimeouts = async () => {
 
             if (updateResult.affectedRows > 0) {
                 console.log(
-                    `⚠️ Payment verification grace period initiated for payment ${payment.id}. Booking #${payment.booking_id}.`
+                    `⚠️ Payment verification 12-hour grace period initiated for payment ${payment.id}. Booking #${payment.booking_id}.`
                 );
+                if (payment.owner_email) {
+                    sendPaymentVerificationWarningEmail({
+                        ownerEmail: payment.owner_email,
+                        ownerName: payment.owner_name,
+                        bookingId: payment.booking_id,
+                        equipmentName: payment.equipment_name,
+                        graceDeadlineHours: 12
+                    }).catch(err => console.error("Payment grace warning email error:", err));
+                }
             }
         }
 
@@ -508,5 +545,24 @@ export const checkPaymentVerificationTimeouts = async () => {
 
     } catch (error) {
         console.error("Payment timeout service error:", error.message || error);
+    }
+};
+
+/**
+ * Scheduled OTP Cleaner:
+ * Automatically prunes OTP records older than 24 hours or already used OTPs older than 1 hour
+ */
+export const cleanExpiredOTPs = async () => {
+    try {
+        const [result] = await pool.query(
+            `DELETE FROM user_otps 
+             WHERE expires_at <= DATE_SUB(NOW(), INTERVAL 24 HOUR) 
+                OR (is_used = TRUE AND created_at <= DATE_SUB(NOW(), INTERVAL 1 HOUR))`
+        );
+        if (result.affectedRows > 0) {
+            console.log(`[OTP Cleaner] Pruned ${result.affectedRows} expired/used OTPs.`);
+        }
+    } catch (error) {
+        console.error("OTP cleaner error:", error.message || error);
     }
 };

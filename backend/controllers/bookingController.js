@@ -29,6 +29,45 @@ export const createBooking = async (req, res) => {
             });
         }
 
+        const startDate = new Date(start_date);
+        const endDate = new Date(end_date);
+
+        if (
+            Number.isNaN(startDate.getTime()) ||
+            Number.isNaN(endDate.getTime())
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid start_date or end_date"
+            });
+        }
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        let startDay;
+        if (typeof start_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
+            const [y, m, d] = start_date.split("-").map(Number);
+            startDay = new Date(y, m - 1, d, 0, 0, 0, 0);
+        } else {
+            startDay = new Date(startDate);
+            startDay.setHours(0, 0, 0, 0);
+        }
+
+        if (startDay < today) {
+            return res.status(400).json({
+                success: false,
+                message: "Rental start date cannot be in the past"
+            });
+        }
+
+        if (endDate <= startDate) {
+            return res.status(400).json({
+                success: false,
+                message: "End date must be after start date"
+            });
+        }
+
         let effectiveFarmerId;
         let assistedByUserId = null;
 
@@ -156,28 +195,6 @@ export const createBooking = async (req, res) => {
                 });
             }
 
-            const startDate = new Date(start_date);
-            const endDate = new Date(end_date);
-
-            if (
-                Number.isNaN(startDate.getTime()) ||
-                Number.isNaN(endDate.getTime())
-            ) {
-                await connection.rollback();
-                return res.status(400).json({
-                    success: false,
-                    message: "Invalid start_date or end_date"
-                });
-            }
-
-            if (endDate <= startDate) {
-                await connection.rollback();
-                return res.status(400).json({
-                    success: false,
-                    message: "End date must be after start date"
-                });
-            }
-
             // Lock and check overlapping bookings inside the transaction
             const [overlappingBookings] = await connection.query(
                 `SELECT id
@@ -225,9 +242,9 @@ export const createBooking = async (req, res) => {
                 });
             }
 
-            const totalAmount = rentalDays * pricePerDay;
+            const totalAmount = Number((rentalDays * pricePerDay).toFixed(2));
 
-            const advanceAmount = totalAmount * 0.20;
+            const advanceAmount = Number((totalAmount * 0.20).toFixed(2));
 
             const [result] = await connection.query(
                 `INSERT INTO bookings (
@@ -304,11 +321,14 @@ export const createBooking = async (req, res) => {
 };
 
 export const acceptBooking = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
+        await connection.beginTransaction();
+
         const { bookingId } = req.params;
 
         // Retrieve authenticated owner profile
-        const [ownerRows] = await pool.query(
+        const [ownerRows] = await connection.query(
             `SELECT id
              FROM owners
              WHERE user_id = ?`,
@@ -316,6 +336,7 @@ export const acceptBooking = async (req, res) => {
         );
 
         if (ownerRows.length === 0) {
+            await connection.rollback();
             return res.status(403).json({
                 success: false,
                 message: "Owner profile not found"
@@ -324,7 +345,7 @@ export const acceptBooking = async (req, res) => {
 
         const authenticatedOwnerId = ownerRows[0].id;
 
-        const [bookings] = await pool.query(
+        const [bookings] = await connection.query(
             `SELECT
                 b.id,
                 b.equipment_id,
@@ -342,11 +363,13 @@ export const acceptBooking = async (req, res) => {
              JOIN equipment e ON b.equipment_id = e.id
              JOIN farmers f ON b.farmer_id = f.id
              JOIN users fu ON f.user_id = fu.id
-             WHERE b.id = ?`,
+             WHERE b.id = ?
+             FOR UPDATE`,
             [bookingId]
         );
 
         if (bookings.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 success: false,
                 message: "Booking not found"
@@ -357,6 +380,7 @@ export const acceptBooking = async (req, res) => {
 
         // Equipment ownership validation: Owner can only accept bookings for their own equipment
         if (booking.owner_id !== authenticatedOwnerId) {
+            await connection.rollback();
             return res.status(403).json({
                 success: false,
                 message: "You are not authorized to accept bookings for equipment you do not own"
@@ -364,6 +388,7 @@ export const acceptBooking = async (req, res) => {
         }
 
         if (booking.status !== "PENDING") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Only pending bookings can be accepted"
@@ -371,7 +396,7 @@ export const acceptBooking = async (req, res) => {
         }
 
         if (booking.is_expired) {
-            await pool.query(
+            await connection.query(
                 `UPDATE bookings
                  SET status = 'CANCELLED',
                      cancellation_reason = 'Owner did not respond within the 4-hour deadline',
@@ -379,6 +404,7 @@ export const acceptBooking = async (req, res) => {
                  WHERE id = ? AND status = 'PENDING'`,
                 [bookingId]
             );
+            await connection.commit();
 
             return res.status(400).json({
                 success: false,
@@ -387,6 +413,7 @@ export const acceptBooking = async (req, res) => {
         }
 
         if (booking.equipment_status !== "AVAILABLE") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Equipment is no longer available"
@@ -397,13 +424,15 @@ export const acceptBooking = async (req, res) => {
             Date.now() + 6 * 60 * 60 * 1000
         );
 
-        await pool.query(
+        await connection.query(
             `UPDATE bookings
             SET status = 'ACCEPTED',
                 payment_deadline = ?
             WHERE id = ?`,
             [paymentDeadline, bookingId]
         );
+
+        await connection.commit();
 
         sendBookingAcceptedEmail({
             farmerEmail: booking.farmer_email,
@@ -423,6 +452,7 @@ export const acceptBooking = async (req, res) => {
         });
 
     } catch (error) {
+        await connection.rollback();
         console.error(
             "Accept booking error:",
             error.message || error
@@ -432,10 +462,13 @@ export const acceptBooking = async (req, res) => {
             success: false,
             message: "Failed to accept booking"
         });
+    } finally {
+        connection.release();
     }
 };
 
 export const rejectBooking = async (req, res) => {
+    const connection = await pool.getConnection();
     try {
         const { bookingId } = req.params;
         const { reason } = req.body;
@@ -447,8 +480,10 @@ export const rejectBooking = async (req, res) => {
             });
         }
 
+        await connection.beginTransaction();
+
         // Retrieve authenticated owner profile
-        const [ownerRows] = await pool.query(
+        const [ownerRows] = await connection.query(
             `SELECT id
              FROM owners
              WHERE user_id = ?`,
@@ -456,6 +491,7 @@ export const rejectBooking = async (req, res) => {
         );
 
         if (ownerRows.length === 0) {
+            await connection.rollback();
             return res.status(403).json({
                 success: false,
                 message: "Owner profile not found"
@@ -464,7 +500,7 @@ export const rejectBooking = async (req, res) => {
 
         const authenticatedOwnerId = ownerRows[0].id;
 
-        const [bookings] = await pool.query(
+        const [bookings] = await connection.query(
             `SELECT
                 b.id,
                 b.status,
@@ -478,11 +514,13 @@ export const rejectBooking = async (req, res) => {
              JOIN equipment e ON b.equipment_id = e.id
              JOIN farmers f ON b.farmer_id = f.id
              JOIN users fu ON f.user_id = fu.id
-             WHERE b.id = ?`,
+             WHERE b.id = ?
+             FOR UPDATE`,
             [bookingId]
         );
 
         if (bookings.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 success: false,
                 message: "Booking not found"
@@ -493,6 +531,7 @@ export const rejectBooking = async (req, res) => {
 
         // Equipment ownership validation: Owner can only reject bookings for their own equipment
         if (booking.owner_id !== authenticatedOwnerId) {
+            await connection.rollback();
             return res.status(403).json({
                 success: false,
                 message: "You are not authorized to reject bookings for equipment you do not own"
@@ -500,6 +539,7 @@ export const rejectBooking = async (req, res) => {
         }
 
         if (booking.status !== "PENDING") {
+            await connection.rollback();
             return res.status(400).json({
                 success: false,
                 message: "Only pending bookings can be rejected"
@@ -507,7 +547,7 @@ export const rejectBooking = async (req, res) => {
         }
 
         if (booking.is_expired) {
-            await pool.query(
+            await connection.query(
                 `UPDATE bookings
                  SET status = 'CANCELLED',
                      cancellation_reason = 'Owner did not respond within the 4-hour deadline',
@@ -515,6 +555,7 @@ export const rejectBooking = async (req, res) => {
                  WHERE id = ? AND status = 'PENDING'`,
                 [bookingId]
             );
+            await connection.commit();
 
             return res.status(400).json({
                 success: false,
@@ -522,13 +563,15 @@ export const rejectBooking = async (req, res) => {
             });
         }
 
-        await pool.query(
+        await connection.query(
             `UPDATE bookings
              SET status = 'REJECTED',
                  cancellation_reason = ?
              WHERE id = ?`,
             [reason.trim(), bookingId]
         );
+
+        await connection.commit();
 
         sendBookingRejectedEmail({
             farmerEmail: booking.farmer_email,
@@ -549,6 +592,7 @@ export const rejectBooking = async (req, res) => {
         });
 
     } catch (error) {
+        await connection.rollback();
         console.error(
             "Reject booking error:",
             error.message || error
@@ -558,6 +602,8 @@ export const rejectBooking = async (req, res) => {
             success: false,
             message: "Failed to reject booking"
         });
+    } finally {
+        connection.release();
     }
 };
 
@@ -1043,6 +1089,150 @@ export const getOwnerBookings = async (req, res) => {
         return res.status(500).json({
             success: false,
             message: "Failed to get owner bookings"
+        });
+    }
+};
+
+export const getAllBookings = async (req, res) => {
+    try {
+        const { role, location_id: adminLocationId, id: userId } = req.user;
+
+        if (role !== "SUPER_ADMIN" && role !== "AREA_ADMIN") {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to view all bookings"
+            });
+        }
+
+        const {
+            status,
+            start_date,
+            end_date,
+            farmer_id,
+            owner_id,
+            equipment_id,
+            page = 1,
+            limit = 20
+        } = req.query;
+
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+        const offset = (pageNum - 1) * limitNum;
+
+        const conditions = [];
+        const params = [];
+
+        // Scoping for AREA_ADMIN:
+        if (role === "AREA_ADMIN") {
+            if (adminLocationId) {
+                conditions.push("(e.location_id = ? OR f.location_id = ? OR o.location_id = ? OR b.assisted_by_user_id = ?)");
+                params.push(adminLocationId, adminLocationId, adminLocationId, userId);
+            } else {
+                conditions.push("b.assisted_by_user_id = ?");
+                params.push(userId);
+            }
+        }
+
+        // Query Filters
+        if (status) {
+            conditions.push("b.status = ?");
+            params.push(status);
+        }
+        if (farmer_id) {
+            conditions.push("b.farmer_id = ?");
+            params.push(farmer_id);
+        }
+        if (owner_id) {
+            conditions.push("e.owner_id = ?");
+            params.push(owner_id);
+        }
+        if (equipment_id) {
+            conditions.push("b.equipment_id = ?");
+            params.push(equipment_id);
+        }
+        if (start_date) {
+            conditions.push("b.start_date >= ?");
+            params.push(start_date);
+        }
+        if (end_date) {
+            conditions.push("b.end_date <= ?");
+            params.push(end_date);
+        }
+
+        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+        // Count query
+        const [countResult] = await pool.query(
+            `SELECT COUNT(b.id) AS total
+             FROM bookings b
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN owners o ON e.owner_id = o.id
+             ${whereClause}`,
+            params
+        );
+        const total = countResult[0].total;
+
+        // Data query
+        const [bookings] = await pool.query(
+            `SELECT
+                b.id AS booking_id,
+                b.start_date,
+                b.end_date,
+                b.price_per_day,
+                b.total_amount,
+                b.advance_amount,
+                b.status,
+                b.cancellation_reason,
+                b.assisted_by_user_id,
+                b.created_at,
+
+                e.id AS equipment_id,
+                e.name AS equipment_name,
+                e.equipment_type,
+                e.location_id AS equipment_location_id,
+
+                f.id AS farmer_id,
+                fu.full_name AS farmer_name,
+                fu.phone AS farmer_phone,
+                fu.email AS farmer_email,
+
+                o.id AS owner_id,
+                ou.full_name AS owner_name,
+                ou.phone AS owner_phone,
+                ou.email AS owner_email,
+
+                au.full_name AS assisted_by_name
+
+             FROM bookings b
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
+             JOIN owners o ON e.owner_id = o.id
+             JOIN users ou ON o.user_id = ou.id
+             LEFT JOIN users au ON b.assisted_by_user_id = au.id
+             ${whereClause}
+             ORDER BY b.created_at DESC
+             LIMIT ? OFFSET ?`,
+            [...params, limitNum, offset]
+        );
+
+        return res.status(200).json({
+            success: true,
+            pagination: {
+                page: pageNum,
+                limit: limitNum,
+                total,
+                totalPages: Math.ceil(total / limitNum)
+            },
+            count: bookings.length,
+            data: bookings
+        });
+    } catch (error) {
+        console.error("Get all bookings error:", error.message || error);
+        return res.status(500).json({
+            success: false,
+            message: "Failed to get bookings"
         });
     }
 };

@@ -415,9 +415,9 @@ export const deleteEquipmentCategory = async (req, res) => {
         const [associatedEquipment] = await pool.query(
             `SELECT id
              FROM equipment
-             WHERE equipment_type = ?
+             WHERE category_id = ?
              LIMIT 1`,
-            [category[0].name]
+            [categoryIdNumber]
         );
 
         if (associatedEquipment.length > 0) {

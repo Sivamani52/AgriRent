@@ -1042,3 +1042,440 @@ export const disputeRefund = async (req, res) => {
         connection.release();
     }
 };
+
+export const getPaymentById = async (req, res) => {
+    try {
+        const { paymentId } = req.params;
+        const [rows] = await pool.query(
+            `SELECT 
+                bp.id AS payment_id,
+                bp.booking_id,
+                bp.amount,
+                bp.payment_method,
+                bp.transaction_id,
+                bp.status AS payment_status,
+                bp.verification_deadline,
+                bp.verified_at,
+                bp.auto_rejected_at,
+                bp.rejection_reason,
+                bp.refund_status,
+                bp.refund_fine_amount,
+                bp.refund_transaction_id,
+                bp.refund_submitted_at,
+                bp.refund_verified_at,
+                bp.submitted_at,
+
+                b.start_date,
+                b.end_date,
+                b.status AS booking_status,
+                b.total_amount AS booking_total_amount,
+                b.advance_amount AS booking_advance_amount,
+
+                e.id AS equipment_id,
+                e.name AS equipment_name,
+                e.location_id AS equipment_location_id,
+
+                f.id AS farmer_id,
+                f.user_id AS farmer_user_id,
+                f.location_id AS farmer_location_id,
+                fu.full_name AS farmer_name,
+                fu.phone AS farmer_phone,
+                fu.email AS farmer_email,
+
+                o.id AS owner_id,
+                o.user_id AS owner_user_id,
+                o.location_id AS owner_location_id,
+                ou.full_name AS owner_name,
+                ou.phone AS owner_phone,
+                ou.email AS owner_email
+
+             FROM booking_payments bp
+             JOIN bookings b ON bp.booking_id = b.id
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
+             JOIN owners o ON e.owner_id = o.id
+             JOIN users ou ON o.user_id = ou.id
+             WHERE bp.id = ?`,
+            [paymentId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ success: false, message: "Payment not found" });
+        }
+
+        const payment = rows[0];
+        const { role, id: userId, location_id: adminLocationId } = req.user;
+
+        // RBAC & Ownership check
+        if (role === "FARMER" && payment.farmer_user_id !== userId) {
+            return res.status(403).json({ success: false, message: "You are not authorized to view this payment" });
+        }
+        if (role === "OWNER" && payment.owner_user_id !== userId) {
+            return res.status(403).json({ success: false, message: "You are not authorized to view this payment" });
+        }
+        if (role === "AREA_ADMIN") {
+            const matchesArea = (
+                !adminLocationId ||
+                payment.equipment_location_id === adminLocationId ||
+                payment.farmer_location_id === adminLocationId ||
+                payment.owner_location_id === adminLocationId
+            );
+            if (!matchesArea) {
+                return res.status(403).json({ success: false, message: "You are not authorized to view payments outside your assigned area" });
+            }
+        } else if (role !== "SUPER_ADMIN" && role !== "FARMER" && role !== "OWNER") {
+            return res.status(403).json({ success: false, message: "Unauthorized" });
+        }
+
+        const {
+            farmer_user_id,
+            owner_user_id,
+            equipment_location_id,
+            farmer_location_id,
+            owner_location_id,
+            ...paymentData
+        } = payment;
+
+        return res.status(200).json({ success: true, data: paymentData });
+    } catch (error) {
+        console.error("Get payment by ID error:", error.message || error);
+        return res.status(500).json({ success: false, message: "Failed to retrieve payment details" });
+    }
+};
+
+export const getBookingPayments = async (req, res) => {
+    try {
+        const { bookingId } = req.params;
+        const [bookingRows] = await pool.query(
+            `SELECT 
+                b.id,
+                f.user_id AS farmer_user_id,
+                f.location_id AS farmer_location_id,
+                o.user_id AS owner_user_id,
+                o.location_id AS owner_location_id,
+                e.location_id AS equipment_location_id
+             FROM bookings b
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN owners o ON e.owner_id = o.id
+             WHERE b.id = ?`,
+            [bookingId]
+        );
+
+        if (bookingRows.length === 0) {
+            return res.status(404).json({ success: false, message: "Booking not found" });
+        }
+
+        const booking = bookingRows[0];
+        const { role, id: userId, location_id: adminLocationId } = req.user;
+
+        if (role === "FARMER" && booking.farmer_user_id !== userId) {
+            return res.status(403).json({ success: false, message: "You are not authorized to view payments for this booking" });
+        }
+        if (role === "OWNER" && booking.owner_user_id !== userId) {
+            return res.status(403).json({ success: false, message: "You are not authorized to view payments for this booking" });
+        }
+        if (role === "AREA_ADMIN") {
+            const matchesArea = (
+                !adminLocationId ||
+                booking.equipment_location_id === adminLocationId ||
+                booking.farmer_location_id === adminLocationId ||
+                booking.owner_location_id === adminLocationId
+            );
+            if (!matchesArea) {
+                return res.status(403).json({ success: false, message: "You are not authorized to view payments outside your assigned area" });
+            }
+        } else if (role !== "SUPER_ADMIN" && role !== "FARMER" && role !== "OWNER") {
+            return res.status(403).json({ success: false, message: "Unauthorized" });
+        }
+
+        const [payments] = await pool.query(
+            `SELECT 
+                bp.id AS payment_id,
+                bp.booking_id,
+                bp.amount,
+                bp.payment_method,
+                bp.transaction_id,
+                bp.status AS payment_status,
+                bp.verification_deadline,
+                bp.verified_at,
+                bp.auto_rejected_at,
+                bp.rejection_reason,
+                bp.refund_status,
+                bp.refund_fine_amount,
+                bp.refund_transaction_id,
+                bp.refund_submitted_at,
+                bp.refund_verified_at,
+                bp.submitted_at
+             FROM booking_payments bp
+             WHERE bp.booking_id = ?
+             ORDER BY bp.submitted_at DESC`,
+            [bookingId]
+        );
+
+        return res.status(200).json({ success: true, count: payments.length, data: payments });
+    } catch (error) {
+        console.error("Get booking payments error:", error.message || error);
+        return res.status(500).json({ success: false, message: "Failed to retrieve booking payments" });
+    }
+};
+
+export const getFarmerPayments = async (req, res) => {
+    try {
+        const [farmerRows] = await pool.query("SELECT id FROM farmers WHERE user_id = ?", [req.user.id]);
+        if (farmerRows.length === 0) {
+            return res.status(404).json({ success: false, message: "Farmer profile not found" });
+        }
+        const farmerId = farmerRows[0].id;
+        const { status, booking_id, page = 1, limit = 20 } = req.query;
+
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+        const offset = (pageNum - 1) * limitNum;
+
+        const conditions = ["b.farmer_id = ?"];
+        const params = [farmerId];
+
+        if (status) {
+            conditions.push("bp.status = ?");
+            params.push(status);
+        }
+        if (booking_id) {
+            conditions.push("bp.booking_id = ?");
+            params.push(booking_id);
+        }
+
+        const whereClause = `WHERE ${conditions.join(" AND ")}`;
+
+        const [countResult] = await pool.query(
+            `SELECT COUNT(bp.id) AS total
+             FROM booking_payments bp
+             JOIN bookings b ON bp.booking_id = b.id
+             ${whereClause}`,
+            params
+        );
+        const total = countResult[0].total;
+
+        const [payments] = await pool.query(
+            `SELECT 
+                bp.id AS payment_id,
+                bp.booking_id,
+                bp.amount,
+                bp.payment_method,
+                bp.transaction_id,
+                bp.status AS payment_status,
+                bp.verification_deadline,
+                bp.verified_at,
+                bp.auto_rejected_at,
+                bp.rejection_reason,
+                bp.refund_status,
+                bp.refund_fine_amount,
+                bp.refund_transaction_id,
+                bp.refund_submitted_at,
+                bp.refund_verified_at,
+                bp.submitted_at,
+                e.name AS equipment_name,
+                ou.full_name AS owner_name
+             FROM booking_payments bp
+             JOIN bookings b ON bp.booking_id = b.id
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN owners o ON e.owner_id = o.id
+             JOIN users ou ON o.user_id = ou.id
+             ${whereClause}
+             ORDER BY bp.submitted_at DESC
+             LIMIT ? OFFSET ?`,
+            [...params, limitNum, offset]
+        );
+
+        return res.status(200).json({
+            success: true,
+            pagination: { page: pageNum, limit: limitNum, total, totalPages: Math.ceil(total / limitNum) },
+            count: payments.length,
+            data: payments
+        });
+    } catch (error) {
+        console.error("Get farmer payments error:", error.message || error);
+        return res.status(500).json({ success: false, message: "Failed to retrieve farmer payments" });
+    }
+};
+
+export const getOwnerPayments = async (req, res) => {
+    try {
+        const [ownerRows] = await pool.query("SELECT id FROM owners WHERE user_id = ?", [req.user.id]);
+        if (ownerRows.length === 0) {
+            return res.status(404).json({ success: false, message: "Owner profile not found" });
+        }
+        const ownerId = ownerRows[0].id;
+        const { status, booking_id, page = 1, limit = 20 } = req.query;
+
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+        const offset = (pageNum - 1) * limitNum;
+
+        const conditions = ["e.owner_id = ?"];
+        const params = [ownerId];
+
+        if (status) {
+            conditions.push("bp.status = ?");
+            params.push(status);
+        }
+        if (booking_id) {
+            conditions.push("bp.booking_id = ?");
+            params.push(booking_id);
+        }
+
+        const whereClause = `WHERE ${conditions.join(" AND ")}`;
+
+        const [countResult] = await pool.query(
+            `SELECT COUNT(bp.id) AS total
+             FROM booking_payments bp
+             JOIN bookings b ON bp.booking_id = b.id
+             JOIN equipment e ON b.equipment_id = e.id
+             ${whereClause}`,
+            params
+        );
+        const total = countResult[0].total;
+
+        const [payments] = await pool.query(
+            `SELECT 
+                bp.id AS payment_id,
+                bp.booking_id,
+                bp.amount,
+                bp.payment_method,
+                bp.transaction_id,
+                bp.status AS payment_status,
+                bp.verification_deadline,
+                bp.verified_at,
+                bp.auto_rejected_at,
+                bp.rejection_reason,
+                bp.refund_status,
+                bp.refund_fine_amount,
+                bp.refund_transaction_id,
+                bp.refund_submitted_at,
+                bp.refund_verified_at,
+                bp.submitted_at,
+                e.name AS equipment_name,
+                fu.full_name AS farmer_name,
+                fu.phone AS farmer_phone
+             FROM booking_payments bp
+             JOIN bookings b ON bp.booking_id = b.id
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
+             ${whereClause}
+             ORDER BY bp.submitted_at DESC
+             LIMIT ? OFFSET ?`,
+            [...params, limitNum, offset]
+        );
+
+        return res.status(200).json({
+            success: true,
+            pagination: { page: pageNum, limit: limitNum, total, totalPages: Math.ceil(total / limitNum) },
+            count: payments.length,
+            data: payments
+        });
+    } catch (error) {
+        console.error("Get owner payments error:", error.message || error);
+        return res.status(500).json({ success: false, message: "Failed to retrieve owner payments" });
+    }
+};
+
+export const getRefunds = async (req, res) => {
+    try {
+        const { role, id: userId, location_id: adminLocationId } = req.user;
+        const { refund_status, page = 1, limit = 20 } = req.query;
+
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+        const offset = (pageNum - 1) * limitNum;
+
+        const conditions = ["bp.refund_status IS NOT NULL"];
+        const params = [];
+
+        if (role === "OWNER") {
+            const [ownerRows] = await pool.query("SELECT id FROM owners WHERE user_id = ?", [userId]);
+            if (ownerRows.length === 0) {
+                return res.status(404).json({ success: false, message: "Owner profile not found" });
+            }
+            conditions.push("e.owner_id = ?");
+            params.push(ownerRows[0].id);
+        } else if (role === "FARMER") {
+            const [farmerRows] = await pool.query("SELECT id FROM farmers WHERE user_id = ?", [userId]);
+            if (farmerRows.length === 0) {
+                return res.status(404).json({ success: false, message: "Farmer profile not found" });
+            }
+            conditions.push("b.farmer_id = ?");
+            params.push(farmerRows[0].id);
+        } else if (role === "AREA_ADMIN") {
+            if (adminLocationId) {
+                conditions.push("(e.location_id = ? OR f.location_id = ?)");
+                params.push(adminLocationId, adminLocationId);
+            }
+        } else if (role !== "SUPER_ADMIN") {
+            return res.status(403).json({ success: false, message: "Unauthorized" });
+        }
+
+        if (refund_status) {
+            conditions.push("bp.refund_status = ?");
+            params.push(refund_status);
+        }
+
+        const whereClause = `WHERE ${conditions.join(" AND ")}`;
+
+        const [countResult] = await pool.query(
+            `SELECT COUNT(bp.id) AS total
+             FROM booking_payments bp
+             JOIN bookings b ON bp.booking_id = b.id
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN farmers f ON b.farmer_id = f.id
+             ${whereClause}`,
+            params
+        );
+        const total = countResult[0].total;
+
+        const [refunds] = await pool.query(
+            `SELECT 
+                bp.id AS payment_id,
+                bp.booking_id,
+                bp.amount,
+                bp.refund_status,
+                bp.refund_fine_amount,
+                bp.refund_transaction_id,
+                bp.refund_required_at,
+                bp.refund_deadline,
+                bp.refund_submitted_at,
+                bp.refund_verified_at,
+                bp.rejection_reason,
+                e.id AS equipment_id,
+                e.name AS equipment_name,
+                fu.full_name AS farmer_name,
+                fu.phone AS farmer_phone,
+                fu.email AS farmer_email,
+                ou.full_name AS owner_name,
+                ou.phone AS owner_phone,
+                ou.email AS owner_email
+             FROM booking_payments bp
+             JOIN bookings b ON bp.booking_id = b.id
+             JOIN equipment e ON b.equipment_id = e.id
+             JOIN farmers f ON b.farmer_id = f.id
+             JOIN users fu ON f.user_id = fu.id
+             JOIN owners o ON e.owner_id = o.id
+             JOIN users ou ON o.user_id = ou.id
+             ${whereClause}
+             ORDER BY bp.refund_required_at DESC, bp.submitted_at DESC
+             LIMIT ? OFFSET ?`,
+            [...params, limitNum, offset]
+        );
+
+        return res.status(200).json({
+            success: true,
+            pagination: { page: pageNum, limit: limitNum, total, totalPages: Math.ceil(total / limitNum) },
+            count: refunds.length,
+            data: refunds
+        });
+    } catch (error) {
+        console.error("Get refunds error:", error.message || error);
+        return res.status(500).json({ success: false, message: "Failed to retrieve refunds" });
+    }
+};

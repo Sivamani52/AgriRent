@@ -1135,10 +1135,17 @@ export const updateDisputeInvestigation = async (req, res) => {
             }
         }
 
-        if (dispute.status === "CLOSED") {
+        if (dispute.status === "CLOSED" || dispute.status === "RESOLVED") {
             return res.status(400).json({
                 success: false,
-                message: "Cannot update investigation on a closed dispute"
+                message: "Cannot update investigation on a closed or resolved dispute"
+            });
+        }
+
+        if (role === "AREA_ADMIN" && dispute.status === "ESCALATED_TO_SUPER_ADMIN") {
+            return res.status(403).json({
+                success: false,
+                message: "This dispute has been escalated to Super Admin and cannot be modified by Area Admin"
             });
         }
 
@@ -1266,7 +1273,7 @@ export const uploadDisputeEvidence = async (req, res) => {
             const isVideo = file.mimetype.startsWith("video/");
             const isImage = file.mimetype.startsWith("image/");
             const resourceType = isVideo ? "video" : (isImage ? "image" : "auto");
-            const inferredType = evidence_type || (isImage ? "IMAGE" : (isVideo ? "IMAGE" : "DOCUMENT"));
+            const inferredType = evidence_type || (isImage ? "IMAGE" : (isVideo ? "VIDEO" : "DOCUMENT"));
 
             const uploadResult = await uploadDisputeBufferToCloudinary(file.buffer, resourceType);
 

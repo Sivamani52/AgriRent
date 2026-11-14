@@ -24,6 +24,21 @@ function getBrevoClient() {
 }
 
 /**
+ * Escapes special HTML characters to prevent XSS / injection in email templates
+ * @param {any} val
+ * @returns {string}
+ */
+export function escapeHtml(val) {
+  if (val === null || val === undefined) return '';
+  return String(val)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+/**
  * Validates email format strictly
  * @param {string} email
  * @returns {boolean}
@@ -56,7 +71,7 @@ export function renderTemplate(templateName, data = {}) {
   try {
     bodyHtml = fs.readFileSync(templatePath, 'utf8');
   } catch (err) {
-    bodyHtml = `<p>${data.message || ''}</p>`;
+    bodyHtml = `<p>${escapeHtml(data.message || '')}</p>`;
   }
 
   // Handle conditional sections {{#key}}content{{/key}}
@@ -71,15 +86,15 @@ export function renderTemplate(templateName, data = {}) {
   // Clear any remaining false conditional sections
   bodyHtml = bodyHtml.replace(/{{#[a-zA-Z0-9_]+}}[\s\S]*?{{\/[a-zA-Z0-9_]+}}/g, '');
 
-  // Handle variable replacements in body {{key}}
+  // Handle variable replacements in body {{key}} (with HTML escaping)
   for (const [key, value] of Object.entries(data)) {
     const varRegex = new RegExp(`{{${key}}}`, 'g');
-    bodyHtml = bodyHtml.replace(varRegex, value !== undefined && value !== null ? String(value) : '');
+    bodyHtml = bodyHtml.replace(varRegex, value !== undefined && value !== null ? escapeHtml(value) : '');
   }
 
   // Inject body into layout
   let finalHtml = layoutHtml.replace('{{{bodyContent}}}', bodyHtml);
-  finalHtml = finalHtml.replace(/{{title}}/g, data.title || 'AgriRent Notification');
+  finalHtml = finalHtml.replace(/{{title}}/g, escapeHtml(data.title || 'AgriRent Notification'));
 
   return finalHtml;
 }
@@ -135,7 +150,10 @@ export async function sendEmail({
     timestamp: new Date().toISOString()
   };
 
-  // Keep an in-memory record for test asserts and auditing
+  // Keep an in-memory record for test asserts and auditing, capped at 500 entries
+  if (sentEmailsLog.length >= 500) {
+    sentEmailsLog.shift();
+  }
   sentEmailsLog.push(emailRecord);
 
   // If in automated test mode without valid remote network or if Brevo key is missing, return success record

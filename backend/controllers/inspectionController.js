@@ -4,7 +4,8 @@ import {
     sendInspectionSubmittedEmail,
     sendHandoverCompletedEmail,
     sendReturnCompletedEmail,
-    sendReturnDamageDisputeEmail
+    sendReturnDamageDisputeEmail,
+    sendAreaAdminDisputeEmail
 } from "../services/notificationService.js";
 
 /**
@@ -337,9 +338,11 @@ export const confirmInitialInspection = async (req, res) => {
                 e.name AS equipment_name,
                 o.user_id AS owner_user_id,
                 ou.phone AS owner_phone,
+                ou.email AS owner_email,
                 ou.full_name AS owner_name,
                 f.user_id AS farmer_user_id,
                 fu.phone AS farmer_phone,
+                fu.email AS farmer_email,
                 fu.full_name AS farmer_name
              FROM bookings b
              JOIN equipment e ON b.equipment_id = e.id
@@ -802,9 +805,11 @@ export const confirmFinalInspection = async (req, res) => {
                 e.location_id,
                 o.user_id AS owner_user_id,
                 ou.phone AS owner_phone,
+                ou.email AS owner_email,
                 ou.full_name AS owner_name,
                 f.user_id AS farmer_user_id,
                 fu.phone AS farmer_phone,
+                fu.email AS farmer_email,
                 fu.full_name AS farmer_name
              FROM bookings b
              JOIN equipment e ON b.equipment_id = e.id
@@ -930,11 +935,14 @@ export const confirmFinalInspection = async (req, res) => {
                 if (existingDisp.length === 0) {
                     // Find area admin for the equipment location
                     const [aaRows] = await connection.query(
-                        `SELECT id FROM area_admins WHERE location_id = ? LIMIT 1`,
+                        `SELECT aa.id, u.email, u.full_name
+                         FROM area_admins aa
+                         JOIN users u ON aa.user_id = u.id
+                         WHERE aa.location_id = ? LIMIT 1`,
                         [booking.location_id]
                     );
 
-                    await connection.query(
+                    const [dispInsert] = await connection.query(
                         `INSERT INTO refund_disputes (
                             booking_id,
                             dispute_reason,
@@ -952,6 +960,16 @@ export const confirmFinalInspection = async (req, res) => {
                             aaRows.length > 0 ? aaRows[0].id : null
                         ]
                     );
+
+                    if (aaRows.length > 0 && aaRows[0].email) {
+                        sendAreaAdminDisputeEmail({
+                            adminEmail: aaRows[0].email,
+                            adminName: aaRows[0].full_name,
+                            bookingId,
+                            disputeId: dispInsert.insertId,
+                            disputeReason: `Return damage flagged: ${damageNotes}`
+                        }).catch(err => console.error("Admin dispute email error:", err));
+                    }
                 }
 
             } else {

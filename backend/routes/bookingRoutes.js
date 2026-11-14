@@ -3,6 +3,7 @@ import express from "express";
 import {
     createBooking,
     getBookingById,
+    getAllBookings,
     getFarmerBookings,
     getOwnerBookings,
     acceptBooking,
@@ -18,6 +19,13 @@ router.post(
     authenticateUser,
     authorizeRoles("FARMER", "AREA_ADMIN"),
     createBooking
+);
+
+router.get(
+    "/bookings",
+    authenticateUser,
+    authorizeRoles("AREA_ADMIN", "SUPER_ADMIN"),
+    getAllBookings
 );
 
 router.patch(

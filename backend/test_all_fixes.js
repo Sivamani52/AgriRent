@@ -1,7 +1,9 @@
 import "dotenv/config";
+import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import pool from "./db.js";
 import express from "express";
+import equipmentCategoryRoutes from "./routes/equipmentCategoryRoutes.js";
 import equipmentRoutes from "./routes/equipmentRoutes.js";
 import equipmentMediaRoutes from "./routes/equipmentMediaRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
@@ -13,7 +15,8 @@ import locationRoutes from "./routes/locationRoutes.js";
 import userManagementRoutes from "./routes/userManagementRoutes.js";
 import {
     checkBookingAcceptanceTimeouts,
-    checkPaymentVerificationTimeouts
+    checkPaymentVerificationTimeouts,
+    cleanExpiredOTPs
 } from "./services/paymentTimeoutService.js";
 import {
     checkInspectionMediaCleanupTimeouts,
@@ -21,10 +24,11 @@ import {
 } from "./services/mediaCleanupService.js";
 import cloudinary from "./config/cloudinary.js";
 import notificationService, { normalizePhoneNumber } from "./services/notificationService.js";
-import emailService, { isValidEmail, renderTemplate, sendEmail, getSentEmails, clearSentEmails, getLastEmailFor } from "./services/emailService.js";
+import emailService, { isValidEmail, renderTemplate, escapeHtml, sendEmail, getSentEmails, clearSentEmails, getLastEmailFor } from "./services/emailService.js";
 
 const app = express();
 app.use(express.json());
+app.use("/api", equipmentCategoryRoutes);
 app.use("/api", equipmentRoutes);
 app.use("/api", equipmentMediaRoutes);
 app.use("/api", paymentRoutes);
@@ -2518,6 +2522,1034 @@ async function runTests() {
     await pool.query("DELETE FROM farmers WHERE user_id IN (SELECT id FROM users WHERE phone = ?)", [mod1Phone]);
     await pool.query("DELETE FROM users WHERE phone IN (?, ?)", [mod1Phone, mod1AaPhone]);
     await pool.query("DELETE FROM locations WHERE district = 'Mod1TestDistrict'");
+
+    // -------------------------------------------------------------------------
+    // 14. MODULE 2: EQUIPMENT CATEGORIES, EQUIPMENT & MEDIA MANAGEMENT (PHASE 4 & 5)
+    // -------------------------------------------------------------------------
+    console.log("\n--- 14. MODULE 2: EQUIPMENT CATEGORIES, EQUIPMENT & MEDIA MANAGEMENT ---");
+
+    // Clean up any existing records from prior test runs
+    await pool.query("DELETE FROM equipment_media WHERE equipment_id IN (SELECT id FROM equipment WHERE name LIKE 'Mod2 Test%')");
+    await pool.query("DELETE FROM equipment WHERE name LIKE 'Mod2 Test%'");
+    await pool.query("DELETE FROM equipment_categories WHERE name LIKE 'Mod2 %'");
+
+    // 14.1 Equipment Categories RBAC & CRUD
+    const resGetCatsPublic = await apiRequest("/equipment-categories");
+    assert(
+        resGetCatsPublic.status === 200 && Array.isArray(resGetCatsPublic.data?.data),
+        "14.1a Public access to GET /equipment-categories succeeds (200)",
+        JSON.stringify(resGetCatsPublic.data)
+    );
+
+    const resFarmerCreateCat = await apiRequest("/equipment-categories", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: { name: "Mod2 Farmer Cat", description: "Farmer cannot create" }
+    });
+    const resAreaAdminCreateCat = await apiRequest("/equipment-categories", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: { name: "Mod2 Area Admin Cat", description: "Area admin cannot create" }
+    });
+    const resSuperCreateCat = await apiRequest("/equipment-categories", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { name: "Mod2 Harvester Category", description: "Heavy duty automated harvesters" }
+    });
+    const createdCatId = resSuperCreateCat.data?.data?.categoryId || resSuperCreateCat.data?.data?.id;
+
+    const resDupCat = await apiRequest("/equipment-categories", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { name: "Mod2 Harvester Category", description: "Duplicate should fail" }
+    });
+
+    const resUpdateCat = await apiRequest(`/equipment-categories/${createdCatId}`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { description: "Updated heavy duty harvesters description" }
+    });
+
+    assert(
+        resFarmerCreateCat.status === 403 &&
+        resAreaAdminCreateCat.status === 403 &&
+        resSuperCreateCat.status === 201 &&
+        resDupCat.status === 409 &&
+        resUpdateCat.status === 200 &&
+        resUpdateCat.data?.data?.description === "Updated heavy duty harvesters description",
+        "14.1b CATEGORY RBAC & CRUD: Non-admins blocked (403), Super Admin create (201), duplicate blocked (409), update succeeds (200)",
+        `farmer=${resFarmerCreateCat.status}, area=${resAreaAdminCreateCat.status}, super=${resSuperCreateCat.status}, dup=${resDupCat.status}, upd=${resUpdateCat.status}`
+    );
+
+    // 14.2 Equipment Creation, Positive Pricing & Automatic equipment_type
+    const resEqNoPrice = await apiRequest("/equipment", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: {
+            name: "Mod2 Test Harvester No Price",
+            category_id: createdCatId,
+            location_id: 1
+        }
+    });
+    const resEqNegativePrice = await apiRequest("/equipment", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: {
+            name: "Mod2 Test Harvester Neg Price",
+            category_id: createdCatId,
+            location_id: 1,
+            price_per_day: -750
+        }
+    });
+    const resEqCreateOk = await apiRequest("/equipment", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: {
+            name: "Mod2 Test Combine Harvester",
+            category_id: createdCatId,
+            location_id: 1,
+            price_per_day: 1200,
+            price_per_hour: 150
+        }
+    });
+    const mod2EqId = resEqCreateOk.data?.data?.equipmentId;
+
+    assert(
+        resEqNoPrice.status === 400 &&
+        resEqNegativePrice.status === 400 &&
+        resEqCreateOk.status === 201 &&
+        resEqCreateOk.data?.data?.equipmentType === "Mod2 Harvester Category" &&
+        resEqCreateOk.data?.data?.status === "UNDER_INSPECTION" &&
+        resEqCreateOk.data?.data?.verificationStatus === "PENDING",
+        "14.2 EQUIPMENT CREATION: Missing/negative prices rejected (400), equipment_type auto-populated from category, initial status UNDER_INSPECTION / PENDING (201)",
+        `noPrice=${resEqNoPrice.status}, negPrice=${resEqNegativePrice.status}, ok=${resEqCreateOk.status}, type=${resEqCreateOk.data?.data?.equipmentType}`
+    );
+
+    // 14.3 Category Deletion Guard (Category in use by equipment)
+    const resDelInUseCat = await apiRequest(`/equipment-categories/${createdCatId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    assert(
+        resDelInUseCat.status === 409 && resDelInUseCat.data?.message?.includes("assigned to existing equipment"),
+        "14.3 CATEGORY DELETION GUARD: Cannot delete category assigned to existing equipment (409)",
+        JSON.stringify(resDelInUseCat.data)
+    );
+
+    // 14.4 Equipment Status State Machine & Administrative Verification
+    // Unverified equipment cannot be set to AVAILABLE
+    const resSetUnverifiedAvail = await apiRequest(`/equipment/${mod2EqId}/status`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: { status: "AVAILABLE" }
+    });
+    assert(
+        resSetUnverifiedAvail.status === 400 && resSetUnverifiedAvail.data?.message?.includes("VERIFIED"),
+        "14.4a STATE MACHINE: Unverified equipment cannot be set to AVAILABLE by owner (400)",
+        JSON.stringify(resSetUnverifiedAvail.data)
+    );
+
+    // Area Admin verifies equipment in their area -> sets VERIFIED and AVAILABLE
+    const resAdminVerifyEqOk = await apiRequest(`/equipment/${mod2EqId}/verification`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: { verification_status: "VERIFIED" }
+    });
+    assert(
+        resAdminVerifyEqOk.status === 200 &&
+        resAdminVerifyEqOk.data?.data?.verificationStatus === "VERIFIED" &&
+        resAdminVerifyEqOk.data?.data?.status === "AVAILABLE",
+        "14.4b EQUIPMENT VERIFICATION: Admin verification updates status to AVAILABLE and verification_status to VERIFIED (200)",
+        JSON.stringify(resAdminVerifyEqOk.data)
+    );
+
+    // Owner sets to MAINTENANCE and back to AVAILABLE
+    const resSetMaint = await apiRequest(`/equipment/${mod2EqId}/status`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: { status: "MAINTENANCE" }
+    });
+    const resRestoreAvail = await apiRequest(`/equipment/${mod2EqId}/status`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: { status: "AVAILABLE" }
+    });
+    // Owner setting to DAMAGED
+    const resSetDamaged = await apiRequest(`/equipment/${mod2EqId}/status`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: { status: "DAMAGED" }
+    });
+    // Direct transition from DAMAGED to AVAILABLE is blocked
+    const resDamagedToAvail = await apiRequest(`/equipment/${mod2EqId}/status`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: { status: "AVAILABLE" }
+    });
+    // Owner manually setting to BOOKED without booking is blocked
+    const resManualBooked = await apiRequest(`/equipment/${mod2EqId}/status`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: { status: "BOOKED" }
+    });
+    // Reset to AVAILABLE via MAINTENANCE for subsequent operations
+    await pool.query("UPDATE equipment SET status = 'AVAILABLE' WHERE id = ?", [mod2EqId]);
+
+    assert(
+        resSetMaint.status === 200 &&
+        resRestoreAvail.status === 200 &&
+        resSetDamaged.status === 200 &&
+        resDamagedToAvail.status === 400 &&
+        resManualBooked.status === 400,
+        "14.4c STATUS STATE MACHINE: Maintenance flow valid (200), DAMAGED->AVAILABLE blocked (400), manual BOOKED blocked (400)",
+        `maint=${resSetMaint.status}, avail=${resRestoreAvail.status}, damaged=${resSetDamaged.status}, dam2Avail=${resDamagedToAvail.status}, booked=${resManualBooked.status}`
+    );
+
+    // 14.5 Equipment Modification & Deletion with Associated Media Cleanup
+    const resUpdateEqOk = await apiRequest(`/equipment/${mod2EqId}`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: {
+            description: "Upgraded GPS guidance system",
+            price_per_day: 1350
+        }
+    });
+    const resUpdateEqNegPrice = await apiRequest(`/equipment/${mod2EqId}`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: { price_per_day: -100 }
+    });
+
+    // Insert associated test media record to test cleanup on deletion
+    await pool.query(
+        "INSERT INTO equipment_media (equipment_id, media_type, file_url, public_id, uploaded_by) VALUES (?, 'IMAGE', 'https://example.com/test.jpg', 'agrirent/test_mod2_media', 1)",
+        [mod2EqId]
+    );
+
+    const resDelEqOk = await apiRequest(`/equipment/${mod2EqId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    const [chkOrphanMedia] = await pool.query("SELECT id FROM equipment_media WHERE equipment_id = ?", [mod2EqId]);
+
+    // Now unreferenced category can be cleanly deleted
+    const resDelCatClean = await apiRequest(`/equipment-categories/${createdCatId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+
+    assert(
+        resUpdateEqOk.status === 200 &&
+        resUpdateEqNegPrice.status === 400 &&
+        resDelEqOk.status === 200 &&
+        chkOrphanMedia.length === 0 &&
+        resDelCatClean.status === 200,
+        "14.5 EQUIPMENT UPDATE & MEDIA CLEANUP: Valid update (200), negative price rejected (400), equipment delete cascades media cleanup (200), unreferenced category deleted (200)",
+        `upd=${resUpdateEqOk.status}, negPrice=${resUpdateEqNegPrice.status}, delEq=${resDelEqOk.status}, mediaLeft=${chkOrphanMedia.length}, delCat=${resDelCatClean.status}`
+    );
+
+    // 14.6 Equipment Search with Pagination, Location & Thumbnail joins
+    const resSearchPaginated = await apiRequest("/equipment/search?page=1&limit=3");
+    assert(
+        resSearchPaginated.status === 200 &&
+        resSearchPaginated.data?.pagination &&
+        resSearchPaginated.data?.pagination?.page === 1 &&
+        resSearchPaginated.data?.pagination?.limit === 3 &&
+        Array.isArray(resSearchPaginated.data?.data),
+        "14.6 SEARCH PAGINATION: GET /equipment/search returns structured pagination (page, limit, total, totalPages) and location data",
+        `total=${resSearchPaginated.data?.pagination?.total}, count=${resSearchPaginated.data?.count}`
+    );
+
+    // 14.7 Administrative Pending Equipment Verification Queue
+    const resPendingQueueAdmin = await apiRequest("/equipment/admin/pending", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${areaAdminToken}` }
+    });
+    const resPendingQueueSuper = await apiRequest("/equipment/admin/pending", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    const resPendingQueueFarmer = await apiRequest("/equipment/admin/pending", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    assert(
+        resPendingQueueAdmin.status === 200 &&
+        resPendingQueueSuper.status === 200 &&
+        resPendingQueueFarmer.status === 403,
+        "14.7 PENDING VERIFICATION QUEUE: Area Admin & Super Admin access pending queue (200), unauthorized roles blocked (403)",
+        `admin=${resPendingQueueAdmin.status}, super=${resPendingQueueSuper.status}, farmer=${resPendingQueueFarmer.status}`
+    );
+
+    // Clean up temporary Module 2 test records
+    await pool.query("DELETE FROM equipment_media WHERE equipment_id IN (SELECT id FROM equipment WHERE name LIKE 'Mod2 Test%')");
+    await pool.query("DELETE FROM equipment WHERE name LIKE 'Mod2 Test%'");
+    await pool.query("DELETE FROM equipment_categories WHERE name LIKE 'Mod2 %'");
+
+    // -------------------------------------------------------------------------
+    // 15. MODULE 3: BOOKINGS, TRANSACTIONS, OVERLAPS & ADMIN QUEUES
+    // -------------------------------------------------------------------------
+    console.log("\n--- 15. BOOKING MANAGEMENT, TRANSACTION LOCKS & ADMIN QUEUES ---");
+
+    // Create dedicated equipment for Module 3 tests belonging to Owner 1
+    const [mod3EqResult] = await pool.query(
+        `INSERT INTO equipment (owner_id, location_id, category_id, name, description, equipment_type, price_per_day, price_per_hour, status, verification_status)
+         VALUES (1, 1, 1, 'Mod3 Test Booking Tractor', 'High performance tractor for booking tests', 'Tractor', 1000, 150, 'AVAILABLE', 'VERIFIED')`
+    );
+    const mod3EqId = mod3EqResult.insertId;
+
+    // 15.1 Past rental date rejection
+    const resPastBooking = await apiRequest("/bookings", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: {
+            equipment_id: mod3EqId,
+            start_date: "2020-01-01",
+            end_date: "2020-01-05"
+        }
+    });
+    assert(
+        resPastBooking.status === 400 && resPastBooking.data?.message?.includes("past"),
+        "15.1 PAST DATE REJECTION: Booking request with past start_date returns 400 with descriptive error",
+        `status=${resPastBooking.status}, msg=${resPastBooking.data?.message}`
+    );
+
+    // 15.2 Valid booking creation with currency rounding
+    const futureStart = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const futureEnd = new Date(Date.now() + 63 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+
+    const resCreateBooking = await apiRequest("/bookings", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: {
+            equipment_id: mod3EqId,
+            start_date: futureStart,
+            end_date: futureEnd
+        }
+    });
+
+    const bkId = resCreateBooking.data?.data?.bookingId;
+    const advanceAmt = resCreateBooking.data?.data?.advanceAmount;
+    const totalAmt = resCreateBooking.data?.data?.totalAmount;
+
+    assert(
+        resCreateBooking.status === 201 &&
+        bkId &&
+        advanceAmt !== undefined &&
+        advanceAmt === Number((totalAmt * 0.20).toFixed(2)),
+        "15.2 BOOKING CREATION & ADVANCE CALCULATION: Advance payment rounded to 2 decimal places (20% of total)",
+        `status=${resCreateBooking.status}, advance=${advanceAmt}, total=${totalAmt}`
+    );
+
+    // 15.3 Overlapping booking prevention inside transaction
+    const resOverlapBooking = await apiRequest("/bookings", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: {
+            equipment_id: mod3EqId,
+            start_date: futureStart,
+            end_date: futureEnd
+        }
+    });
+    assert(
+        resOverlapBooking.status === 409,
+        "15.3 OVERLAP PREVENTION: Duplicate / overlapping booking dates return 409 conflict",
+        `status=${resOverlapBooking.status}, msg=${resOverlapBooking.data?.message}`
+    );
+
+    // 15.4 Transactional Owner Acceptance
+    const resAccept = await apiRequest(`/bookings/${bkId}/accept`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    const resDoubleAccept = await apiRequest(`/bookings/${bkId}/accept`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    assert(
+        resAccept.status === 200 &&
+        resAccept.data?.data?.status === "ACCEPTED" &&
+        resDoubleAccept.status === 400,
+        "15.4 OWNER ACCEPTANCE: Booking successfully accepted (200), duplicate acceptance rejected (400)",
+        `accept=${resAccept.status}, re-accept=${resDoubleAccept.status}`
+    );
+
+    // 15.5 Transactional Owner Rejection
+    const futureStart2 = new Date(Date.now() + 70 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const futureEnd2 = new Date(Date.now() + 72 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const resCreateBooking2 = await apiRequest("/bookings", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${farmerToken}` },
+        body: {
+            equipment_id: mod3EqId,
+            start_date: futureStart2,
+            end_date: futureEnd2
+        }
+    });
+    const bkId2 = resCreateBooking2.data?.data?.bookingId;
+
+    const resReject = await apiRequest(`/bookings/${bkId2}/reject`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` },
+        body: { reason: "Routine scheduled maintenance" }
+    });
+    const [chkRejectDb] = await pool.query("SELECT status, cancellation_reason FROM bookings WHERE id = ?", [bkId2]);
+
+    assert(
+        resReject.status === 200 &&
+        chkRejectDb[0]?.status === "REJECTED" &&
+        chkRejectDb[0]?.cancellation_reason === "Routine scheduled maintenance",
+        "15.5 OWNER REJECTION: Booking rejected with mandatory reason (200) and reason persisted",
+        `status=${resReject.status}, dbStatus=${chkRejectDb[0]?.status}`
+    );
+
+    // 15.6 Administrative Bookings Listing with Scoping and Filters
+    const resAdminBookingsSuper = await apiRequest("/bookings?page=1&limit=5", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    const resAdminBookingsArea = await apiRequest("/bookings?page=1&limit=5", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${areaAdminToken}` }
+    });
+    const resAdminBookingsFarmer = await apiRequest("/bookings", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    const resAdminBookingsFilter = await apiRequest("/bookings?status=ACCEPTED", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+
+    const filterAllAccepted = resAdminBookingsFilter.data?.data?.every(b => b.status === "ACCEPTED");
+
+    assert(
+        resAdminBookingsSuper.status === 200 &&
+        resAdminBookingsSuper.data?.pagination?.total !== undefined &&
+        resAdminBookingsArea.status === 200 &&
+        resAdminBookingsFarmer.status === 403 &&
+        resAdminBookingsFilter.status === 200 &&
+        filterAllAccepted === true,
+        "15.6 ADMIN BOOKINGS LIST & FILTERS: Super & Area Admin list bookings (200), Farmer blocked (403), status filter enforced",
+        `super=${resAdminBookingsSuper.status}, area=${resAdminBookingsArea.status}, farmer=${resAdminBookingsFarmer.status}, filterAllAccepted=${filterAllAccepted}`
+    );
+
+    // Clean up temporary Module 3 test bookings and equipment
+    await pool.query("DELETE FROM bookings WHERE id IN (?, ?)", [bkId, bkId2]);
+    await pool.query("DELETE FROM equipment WHERE id = ?", [mod3EqId]);
+
+    // -------------------------------------------------------------------------
+    // 16. MODULE 4: PAYMENTS, REFUNDS, READ APIS, 12H GRACE & JOBS
+    // -------------------------------------------------------------------------
+    console.log("\n--- 16. PAYMENTS, REFUNDS, READ APIS, 12H GRACE & JOBS ---");
+
+    // 16.1 GET /payments/:paymentId (Read payment details)
+    const [pRow] = await pool.query(
+        "SELECT id, booking_id FROM booking_payments WHERE status = 'PAYMENT_VERIFIED' LIMIT 1"
+    );
+    let testPayId = pRow[0]?.id;
+    let testPayBkId = pRow[0]?.booking_id;
+
+    if (!testPayId) {
+        const [insBk] = await pool.query(
+            "INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status) VALUES (3, 1, NOW(), DATE_ADD(NOW(), INTERVAL 2 DAY), 500, 1000, 200, 'CONFIRMED')"
+        );
+        testPayBkId = insBk.insertId;
+        const [insP] = await pool.query(
+            "INSERT INTO booking_payments (booking_id, amount, payment_method, transaction_id, status) VALUES (?, 200, 'UPI', 'TXN_MOD4_READ_01', 'PAYMENT_VERIFIED')",
+            [testPayBkId]
+        );
+        testPayId = insP.insertId;
+    }
+
+    const resGetPayment = await apiRequest(`/payments/${testPayId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    const resGetPaymentOwner = await apiRequest(`/payments/${testPayId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    const resGetPaymentOwner2 = await apiRequest(`/payments/${testPayId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${owner2Token}` }
+    });
+
+    assert(
+        resGetPayment.status === 200 &&
+        resGetPayment.data?.data?.payment_id === testPayId &&
+        resGetPaymentOwner.status === 200 &&
+        resGetPaymentOwner2.status === 403,
+        "16.1 GET /payments/:paymentId: Authorized farmer and owner access details (200), unrelated owner blocked (403)",
+        `farmer=${resGetPayment.status}, owner=${resGetPaymentOwner.status}, wrongOwner=${resGetPaymentOwner2.status}`
+    );
+
+    // 16.2 GET /payments/booking/:bookingId
+    const resBookingPayments = await apiRequest(`/payments/booking/${testPayBkId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    assert(
+        resBookingPayments.status === 200 &&
+        Array.isArray(resBookingPayments.data?.data) &&
+        resBookingPayments.data?.data?.length > 0,
+        "16.2 GET /payments/booking/:bookingId: Returns array of payments for booking (200)",
+        `status=${resBookingPayments.status}, count=${resBookingPayments.data?.count}`
+    );
+
+    // 16.3 GET /payments/farmer
+    const resFarmerPayments = await apiRequest("/payments/farmer?page=1&limit=5", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+    assert(
+        resFarmerPayments.status === 200 &&
+        resFarmerPayments.data?.pagination?.page === 1 &&
+        Array.isArray(resFarmerPayments.data?.data),
+        "16.3 GET /payments/farmer: Farmer views paginated submitted payments (200)",
+        `status=${resFarmerPayments.status}, count=${resFarmerPayments.data?.count}`
+    );
+
+    // 16.4 GET /payments/owner
+    const resOwnerPayments = await apiRequest("/payments/owner?page=1&limit=5", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    assert(
+        resOwnerPayments.status === 200 &&
+        resOwnerPayments.data?.pagination?.page === 1 &&
+        Array.isArray(resOwnerPayments.data?.data),
+        "16.4 GET /payments/owner: Owner views paginated received payments (200)",
+        `status=${resOwnerPayments.status}, count=${resOwnerPayments.data?.count}`
+    );
+
+    // 16.5 GET /payments/refunds
+    const resRefunds = await apiRequest("/payments/refunds", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${superAdminToken}` }
+    });
+    assert(
+        resRefunds.status === 200 &&
+        Array.isArray(resRefunds.data?.data),
+        "16.5 GET /payments/refunds: Admin views refund records list (200)",
+        `status=${resRefunds.status}, count=${resRefunds.data?.count}`
+    );
+
+    // 16.6 12-Hour Payment Verification Grace Period & Warning
+    const [graceBk] = await pool.query(
+        "INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status) VALUES (3, 1, DATE_ADD(NOW(), INTERVAL 50 DAY), DATE_ADD(NOW(), INTERVAL 52 DAY), 500, 1000, 200, 'ACCEPTED')"
+    );
+    const graceBkId = graceBk.insertId;
+    const [gracePay] = await pool.query(
+        `INSERT INTO booking_payments (booking_id, amount, payment_method, transaction_id, status, verification_deadline)
+         VALUES (?, 200, 'UPI', 'TXN_GRACE_12H', 'PAYMENT_PENDING', DATE_SUB(NOW(), INTERVAL 1 HOUR))`,
+        [graceBkId]
+    );
+    const gracePayId = gracePay.insertId;
+
+    await checkPaymentVerificationTimeouts();
+
+    const [chkGraceDb] = await pool.query(
+        "SELECT admin_warning_sent_at, admin_grace_deadline FROM booking_payments WHERE id = ?",
+        [gracePayId]
+    );
+    const graceDeadlineTime = new Date(chkGraceDb[0]?.admin_grace_deadline).getTime();
+    const expectedMinTime = Date.now() + 11 * 60 * 60 * 1000;
+    const expectedMaxTime = Date.now() + 13 * 60 * 60 * 1000;
+
+    assert(
+        chkGraceDb[0]?.admin_warning_sent_at !== null &&
+        graceDeadlineTime >= expectedMinTime &&
+        graceDeadlineTime <= expectedMaxTime,
+        "16.6 12-HOUR GRACE PERIOD: Warning timestamp recorded and grace deadline set to 12 hours from now",
+        `warningSent=${chkGraceDb[0]?.admin_warning_sent_at}, graceDeadline=${chkGraceDb[0]?.admin_grace_deadline}`
+    );
+
+    // Clean up grace test records
+    await pool.query("DELETE FROM booking_payments WHERE id = ?", [gracePayId]);
+    await pool.query("DELETE FROM bookings WHERE id = ?", [graceBkId]);
+
+    // 16.7 Scheduled OTP Cleanup
+    const [insExpiredOtp] = await pool.query(
+        `INSERT INTO user_otps (email, phone, otp_hash, purpose, expires_at, is_used)
+         VALUES ('clean@test.com', '9999900001', 'dummyhash', 'REGISTRATION', DATE_SUB(NOW(), INTERVAL 26 HOUR), FALSE)`
+    );
+    const expiredOtpId = insExpiredOtp.insertId;
+
+    await cleanExpiredOTPs();
+
+    const [chkPrunedOtp] = await pool.query("SELECT id FROM user_otps WHERE id = ?", [expiredOtpId]);
+    assert(
+        chkPrunedOtp.length === 0,
+        "16.7 SCHEDULED OTP CLEANUP: cleanExpiredOTPs() prunes expired OTP records older than 24 hours",
+        `remaining=${chkPrunedOtp.length}`
+    );
+
+    // 16.8 HTML Escaping in Email Templates
+    const unescapedXSS = "<script>alert('xss')</script>";
+    const escapedOutput = escapeHtml(unescapedXSS);
+    assert(
+        escapedOutput === "&lt;script&gt;alert(&#039;xss&#039;)&lt;/script&gt;",
+        "16.8 EMAIL HTML ESCAPING: escapeHtml strictly neutralizes HTML markup and script tags",
+        `escaped=${escapedOutput}`
+    );
+
+    // -------------------------------------------------------------------------
+    // 17. MODULE 5: INSPECTIONS, EVIDENCE & DISPUTE INVESTIGATIONS
+    // -------------------------------------------------------------------------
+    console.log("\n--- 17. INSPECTIONS, EVIDENCE & DISPUTE INVESTIGATIONS ---");
+
+    // 17.1 Initial Inspection Handover Flow & Email Dispatch
+    // Create test booking in CONFIRMED status
+    const [inspBk] = await pool.query(
+        "INSERT INTO bookings (equipment_id, farmer_id, start_date, end_date, price_per_day, total_amount, advance_amount, status) VALUES (3, 1, NOW(), DATE_ADD(NOW(), INTERVAL 3 DAY), 500, 1500, 300, 'CONFIRMED')"
+    );
+    const m5BkId = inspBk.insertId;
+
+    // Both parties record initial inspection
+    await pool.query(
+        `INSERT INTO equipment_inspections (
+            booking_id, equipment_id, inspection_stage, inspector_role, inspector_user_id,
+            engine_condition, tyres_condition, body_condition, fuel_level, is_confirmed
+         ) VALUES
+         (?, 3, 'INITIAL', 'OWNER', 1, 'GOOD', 'GOOD', 'GOOD', 'FULL', FALSE),
+         (?, 3, 'INITIAL', 'FARMER', 2, 'GOOD', 'GOOD', 'GOOD', 'FULL', FALSE)`,
+        [m5BkId, m5BkId]
+    );
+
+    clearSentEmails();
+
+    const resOwnerConfInit = await apiRequest(`/bookings/${m5BkId}/inspections/initial/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    const resFarmerConfInit = await apiRequest(`/bookings/${m5BkId}/inspections/initial/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+
+    const [chkHandoverBk] = await pool.query("SELECT status FROM bookings WHERE id = ?", [m5BkId]);
+    const [chkHandoverEq] = await pool.query("SELECT status FROM equipment WHERE id = 3");
+
+    const handoverEmails = getSentEmails().filter(e => e.subject?.includes("Handover") || e.subject?.includes("Active"));
+    const allEmailsHaveValidTo = handoverEmails.every(e => e.to && e.to !== "undefined");
+
+    assert(
+        resOwnerConfInit.status === 200 &&
+        resFarmerConfInit.status === 200 &&
+        chkHandoverBk[0]?.status === "IN_PROGRESS" &&
+        chkHandoverEq[0]?.status === "IN_USE" &&
+        allEmailsHaveValidTo,
+        "17.1 INITIAL INSPECTION & HANDOVER: Both parties confirm, status -> IN_PROGRESS, equipment -> IN_USE, non-undefined emails dispatched",
+        `bkStatus=${chkHandoverBk[0]?.status}, eqStatus=${chkHandoverEq[0]?.status}, emailCount=${handoverEmails.length}`
+    );
+
+    // 17.2 Final Return Inspection with Damage & Dispute Auto-Creation
+    await pool.query(
+        `INSERT INTO equipment_inspections (
+            booking_id, equipment_id, inspection_stage, inspector_role, inspector_user_id,
+            engine_condition, tyres_condition, body_condition, fuel_level, is_damage_reported, damage_description, is_confirmed
+         ) VALUES
+         (?, 3, 'FINAL', 'OWNER', 1, 'GOOD', 'GOOD', 'DAMAGED', 'HALF', TRUE, 'Broken hydraulic arm', FALSE),
+         (?, 3, 'FINAL', 'FARMER', 2, 'GOOD', 'GOOD', 'GOOD', 'HALF', FALSE, null, FALSE)`,
+        [m5BkId, m5BkId]
+    );
+
+    clearSentEmails();
+
+    const resOwnerConfFinal = await apiRequest(`/bookings/${m5BkId}/inspections/final/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    const resFarmerConfFinal = await apiRequest(`/bookings/${m5BkId}/inspections/final/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${farmerToken}` }
+    });
+
+    const [chkReturnBk] = await pool.query("SELECT status FROM bookings WHERE id = ?", [m5BkId]);
+    const [chkReturnEq] = await pool.query("SELECT status FROM equipment WHERE id = 3");
+    const [chkReturnDisp] = await pool.query("SELECT id, status, assigned_area_admin_id FROM refund_disputes WHERE booking_id = ?", [m5BkId]);
+
+    assert(
+        resOwnerConfFinal.status === 200 &&
+        resFarmerConfFinal.status === 200 &&
+        chkReturnBk[0]?.status === "DISPUTED" &&
+        chkReturnEq[0]?.status === "DAMAGED" &&
+        chkReturnDisp.length > 0 &&
+        chkReturnDisp[0].status === "UNDER_ADMIN_REVIEW",
+        "17.2 RETURN INSPECTION DAMAGE: Damage sets booking -> DISPUTED, equipment -> DAMAGED, auto-creates dispute",
+        `bkStatus=${chkReturnBk[0]?.status}, eqStatus=${chkReturnEq[0]?.status}, dispCount=${chkReturnDisp.length}`
+    );
+
+    const m5DisputeId = chkReturnDisp[0].id;
+
+    // 17.3 Dispute Investigation Guard: Area Admin blocked from updating ESCALATED_TO_SUPER_ADMIN dispute
+    await pool.query("UPDATE refund_disputes SET status = 'ESCALATED_TO_SUPER_ADMIN' WHERE id = ?", [m5DisputeId]);
+
+    const resAreaAdminEditEscalated = await apiRequest(`/admin/disputes/${m5DisputeId}/investigation`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${areaAdminToken}` },
+        body: { investigationFindings: "Area admin overrides findings" }
+    });
+    assert(
+        resAreaAdminEditEscalated.status === 403,
+        "17.3 DISPUTE ESCALATION GUARD: Area Admin cannot modify an ESCALATED_TO_SUPER_ADMIN dispute (403)",
+        `status=${resAreaAdminEditEscalated.status}`
+    );
+
+    // 17.4 Dispute Investigation Guard: Modifying RESOLVED dispute rejected
+    await pool.query("UPDATE refund_disputes SET status = 'RESOLVED' WHERE id = ?", [m5DisputeId]);
+
+    const resEditResolved = await apiRequest(`/admin/disputes/${m5DisputeId}/investigation`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { investigationFindings: "Trying to edit resolved" }
+    });
+    assert(
+        resEditResolved.status === 400,
+        "17.4 DISPUTE RESOLVED GUARD: Updating investigation on a RESOLVED dispute rejected with 400",
+        `status=${resEditResolved.status}`
+    );
+
+    // Clean up temporary Module 5 test records
+    await pool.query("DELETE FROM refund_disputes WHERE booking_id = ?", [m5BkId]);
+    await pool.query("DELETE FROM equipment_inspections WHERE booking_id = ?", [m5BkId]);
+    await pool.query("DELETE FROM bookings WHERE id = ?", [m5BkId]);
+    await pool.query("UPDATE equipment SET status = 'AVAILABLE' WHERE id = 3");
+
+    // -------------------------------------------------------------------------
+    // 18. MODULE 7: COMPLETE 17-STEP END-TO-END RENTAL LIFECYCLE TEST
+    // -------------------------------------------------------------------------
+    console.log("\n=================================================");
+    console.log("--- 18. COMPLETE 17-STEP END-TO-END PLATFORM LIFECYCLE ---");
+    console.log("=================================================");
+
+    const e2eSuffix = Date.now().toString().slice(-6);
+    const e2eFarmerEmail = `e2e.farmer.${e2eSuffix}@agrirent.test`;
+    const e2eFarmerPhone = `98${e2eSuffix.padStart(8, "1")}`;
+    const e2eOwnerEmail = `e2e.owner.${e2eSuffix}@agrirent.test`;
+    const e2eOwnerPhone = `97${e2eSuffix.padStart(8, "2")}`;
+
+    // Resolve location and category for E2E flow
+    const [e2eLocRows] = await pool.query("SELECT id FROM locations LIMIT 1");
+    const e2eLocationId = e2eLocRows[0]?.id || 1;
+    const [e2eCatRows] = await pool.query("SELECT id FROM equipment_categories LIMIT 1");
+    const e2eCategoryId = e2eCatRows[0]?.id || 1;
+
+    // STEP 1: Registration
+    const resE2eRegFarmer = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "E2E Farmer",
+            email: e2eFarmerEmail,
+            phone: e2eFarmerPhone,
+            password: "Password@123",
+            role: "FARMER",
+            location_id: e2eLocationId
+        }
+    });
+    const resE2eRegOwner = await apiRequest("/auth/register", {
+        method: "POST",
+        body: {
+            full_name: "E2E Owner",
+            email: e2eOwnerEmail,
+            phone: e2eOwnerPhone,
+            password: "Password@123",
+            role: "OWNER",
+            location_id: e2eLocationId
+        }
+    });
+    assert(
+        resE2eRegFarmer.status === 201 && resE2eRegOwner.status === 201,
+        "E2E Step 1: User Registration (Farmer & Owner created with unique email & phone)",
+        `farmer=${resE2eRegFarmer.status}, owner=${resE2eRegOwner.status}`
+    );
+
+    // STEP 2: Email OTP Verification
+    const [fOtpRow] = await pool.query(
+        "SELECT id FROM user_otps WHERE email = ? AND purpose = 'REGISTRATION' ORDER BY id DESC LIMIT 1",
+        [e2eFarmerEmail]
+    );
+    const [oOtpRow] = await pool.query(
+        "SELECT id FROM user_otps WHERE email = ? AND purpose = 'REGISTRATION' ORDER BY id DESC LIMIT 1",
+        [e2eOwnerEmail]
+    );
+    const fixedOtp = "123456";
+    const fixedHash = await bcrypt.hash(fixedOtp, 10);
+    if (fOtpRow.length > 0) await pool.query("UPDATE user_otps SET otp_hash = ? WHERE id = ?", [fixedHash, fOtpRow[0].id]);
+    if (oOtpRow.length > 0) await pool.query("UPDATE user_otps SET otp_hash = ? WHERE id = ?", [fixedHash, oOtpRow[0].id]);
+
+    const resE2eVrfFarmer = await apiRequest("/auth/otp/verify", {
+        method: "POST",
+        body: { email: e2eFarmerEmail, otp: fixedOtp, purpose: "REGISTRATION" }
+    });
+    const resE2eVrfOwner = await apiRequest("/auth/otp/verify", {
+        method: "POST",
+        body: { email: e2eOwnerEmail, otp: fixedOtp, purpose: "REGISTRATION" }
+    });
+    assert(
+        resE2eVrfFarmer.status === 200 && resE2eVrfOwner.status === 200,
+        "E2E Step 2: Email OTP Verification (Accounts successfully verified and activated)",
+        `farmer=${resE2eVrfFarmer.status}, owner=${resE2eVrfOwner.status}`
+    );
+
+    // STEP 3: Login & JWT Authentication
+    const resE2eLogFarmer = await apiRequest("/auth/login", {
+        method: "POST",
+        body: { identifier: e2eFarmerEmail, password: "Password@123" }
+    });
+    const resE2eLogOwner = await apiRequest("/auth/login", {
+        method: "POST",
+        body: { identifier: e2eOwnerEmail, password: "Password@123" }
+    });
+    const e2eFarmerToken = resE2eLogFarmer.data?.data?.token;
+    const e2eOwnerToken = resE2eLogOwner.data?.data?.token;
+    const e2eFarmerUserId = resE2eLogFarmer.data?.data?.user?.id;
+    const e2eOwnerUserId = resE2eLogOwner.data?.data?.user?.id;
+    const [e2eOwnerProfile] = await pool.query("SELECT id FROM owners WHERE user_id = ?", [e2eOwnerUserId]);
+    const e2eOwnerId = e2eOwnerProfile[0]?.id;
+
+    assert(
+        resE2eLogFarmer.status === 200 && e2eFarmerToken &&
+        resE2eLogOwner.status === 200 && e2eOwnerToken,
+        "E2E Step 3: Login & JWT Authentication (Both users receive JWT tokens and active status)",
+        `fToken=${Boolean(e2eFarmerToken)}, oToken=${Boolean(e2eOwnerToken)}`
+    );
+
+    // STEP 4: Location Management & Owner Verification
+    await pool.query("UPDATE owners SET location_id = ?, verification_status = 'VERIFIED' WHERE id = ?", [e2eLocationId, e2eOwnerId]);
+    assert(
+        true,
+        "E2E Step 4: Location Assignment & Owner Profile Verification",
+        `locationId=${e2eLocationId}, ownerId=${e2eOwnerId}`
+    );
+
+    // STEP 5: Category Verification
+    assert(
+        Boolean(e2eCategoryId),
+        "E2E Step 5: Equipment Category Available",
+        `categoryId=${e2eCategoryId}`
+    );
+
+    // STEP 6: Equipment Registration
+    const resE2eCreateEq = await apiRequest("/equipment", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${e2eOwnerToken}` },
+        body: {
+            name: `E2E Power Harvester ${e2eSuffix}`,
+            category_id: e2eCategoryId,
+            location_id: e2eLocationId,
+            description: "Heavy duty harvest machine with advanced threshing system",
+            price_per_day: 2500,
+            price_per_hour: 300
+        }
+    });
+    const e2eEquipmentId = resE2eCreateEq.data?.data?.equipmentId || resE2eCreateEq.data?.data?.id;
+    assert(
+        resE2eCreateEq.status === 201 && e2eEquipmentId,
+        "E2E Step 6: Owner Equipment Registration (Created with UNDER_INSPECTION & PENDING verification)",
+        `status=${resE2eCreateEq.status}, eqId=${e2eEquipmentId}`
+    );
+
+    // STEP 7: Equipment Media Upload
+    await pool.query(
+        "INSERT INTO equipment_media (equipment_id, media_type, file_url, public_id, uploaded_by) VALUES (?, 'IMAGE', 'https://example.com/e2e_harvester.jpg', 'agrirent/e2e_harvester', ?)",
+        [e2eEquipmentId, e2eOwnerUserId]
+    );
+    const [e2eMediaRows] = await pool.query("SELECT id FROM equipment_media WHERE equipment_id = ?", [e2eEquipmentId]);
+    assert(
+        e2eMediaRows.length > 0,
+        "E2E Step 7: Equipment Media Upload (Image recorded and linked to equipment)",
+        `mediaCount=${e2eMediaRows.length}`
+    );
+
+    // STEP 8: Administrative Equipment Verification
+    const resE2eVerifyEq = await apiRequest(`/equipment/${e2eEquipmentId}/verify`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: { verification_status: "VERIFIED", remarks: "E2E Field inspection passed" }
+    });
+    const [chkEqVerified] = await pool.query("SELECT status, verification_status FROM equipment WHERE id = ?", [e2eEquipmentId]);
+    assert(
+        resE2eVerifyEq.status === 200 &&
+        chkEqVerified[0]?.status === "AVAILABLE" &&
+        chkEqVerified[0]?.verification_status === "VERIFIED",
+        "E2E Step 8: Admin Equipment Verification (Transitions status to AVAILABLE and verification to VERIFIED)",
+        `status=${chkEqVerified[0]?.status}, verif=${chkEqVerified[0]?.verification_status}`
+    );
+
+    // STEP 9: Public Equipment Search & Filtering
+    const resE2eSearchEq = await apiRequest(`/equipment/search?category_id=${e2eCategoryId}&location_id=${e2eLocationId}&availability=AVAILABLE`);
+    const foundInSearch = resE2eSearchEq.data?.data?.some(eq => eq.id === e2eEquipmentId);
+    assert(
+        resE2eSearchEq.status === 200 && foundInSearch,
+        "E2E Step 9: Equipment Search (Verified available equipment surfaces in public search results)",
+        `status=${resE2eSearchEq.status}, found=${foundInSearch}`
+    );
+
+    // STEP 10: Farmer Booking Request
+    const e2eStart = new Date(Date.now() + 80 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const e2eEnd = new Date(Date.now() + 82 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+
+    const resE2eFarmerBooking = await apiRequest("/bookings", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${e2eFarmerToken}` },
+        body: {
+            equipment_id: e2eEquipmentId,
+            start_date: e2eStart,
+            end_date: e2eEnd
+        }
+    });
+    const e2eBkId = resE2eFarmerBooking.data?.data?.bookingId;
+    const e2eAdvanceAmt = resE2eFarmerBooking.data?.data?.advanceAmount;
+    assert(
+        resE2eFarmerBooking.status === 201 && e2eBkId && e2eAdvanceAmt === 1000,
+        "E2E Step 10: Farmer Booking Request (Booking created in PENDING with 20% advance: ₹1000 of ₹5000)",
+        `status=${resE2eFarmerBooking.status}, bkId=${e2eBkId}, advance=${e2eAdvanceAmt}`
+    );
+
+    // STEP 11: Owner Booking Acceptance
+    const resE2eOwnerAccept = await apiRequest(`/bookings/${e2eBkId}/accept`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${e2eOwnerToken}` }
+    });
+    const [chkE2eAccepted] = await pool.query("SELECT status, payment_deadline FROM bookings WHERE id = ?", [e2eBkId]);
+    assert(
+        resE2eOwnerAccept.status === 200 &&
+        chkE2eAccepted[0]?.status === "ACCEPTED" &&
+        chkE2eAccepted[0]?.payment_deadline !== null,
+        "E2E Step 11: Owner Booking Acceptance (Booking accepted within deadline, payment_deadline assigned)",
+        `status=${chkE2eAccepted[0]?.status}`
+    );
+
+    // STEP 12: Advance Payment Submission
+    const resE2eSubmitPay = await apiRequest("/payments", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${e2eFarmerToken}` },
+        body: {
+            booking_id: e2eBkId,
+            amount: 1000,
+            payment_method: "UPI",
+            transaction_id: `TXN_E2E_${e2eSuffix}`
+        }
+    });
+    const e2ePaymentId = resE2eSubmitPay.data?.data?.paymentId;
+    assert(
+        resE2eSubmitPay.status === 201 && e2ePaymentId,
+        "E2E Step 12: Advance Payment Submission (UPI transaction ID submitted, status PAYMENT_PENDING)",
+        `status=${resE2eSubmitPay.status}, paymentId=${e2ePaymentId}`
+    );
+
+    // STEP 13: Owner Payment Verification
+    const resE2eVerifyPay = await apiRequest(`/payments/${e2ePaymentId}/verify`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${e2eOwnerToken}` }
+    });
+    const [chkE2eConfirmedBk] = await pool.query("SELECT status FROM bookings WHERE id = ?", [e2eBkId]);
+    const [chkE2eVerifiedPay] = await pool.query("SELECT status FROM booking_payments WHERE id = ?", [e2ePaymentId]);
+    assert(
+        resE2eVerifyPay.status === 200 &&
+        chkE2eConfirmedBk[0]?.status === "CONFIRMED" &&
+        chkE2eVerifiedPay[0]?.status === "PAYMENT_VERIFIED",
+        "E2E Step 13: Owner Payment Verification (Payment verified, booking confirmed together in atomic transaction)",
+        `bkStatus=${chkE2eConfirmedBk[0]?.status}, payStatus=${chkE2eVerifiedPay[0]?.status}`
+    );
+
+    // STEP 14: Stage 1 Initial Equipment Inspection & Handover
+    await pool.query(
+        `INSERT INTO equipment_inspections (
+            booking_id, equipment_id, inspection_stage, inspector_role, inspector_user_id,
+            engine_condition, tyres_condition, body_condition, fuel_level, is_confirmed
+         ) VALUES
+         (?, ?, 'INITIAL', 'OWNER', ?, 'EXCELLENT', 'GOOD', 'GOOD', 'FULL', FALSE),
+         (?, ?, 'INITIAL', 'FARMER', ?, 'EXCELLENT', 'GOOD', 'GOOD', 'FULL', FALSE)`,
+        [e2eBkId, e2eEquipmentId, e2eOwnerUserId, e2eBkId, e2eEquipmentId, e2eFarmerUserId]
+    );
+
+    const resE2eOwnerInitConf = await apiRequest(`/bookings/${e2eBkId}/inspections/initial/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${e2eOwnerToken}` }
+    });
+    const resE2eFarmerInitConf = await apiRequest(`/bookings/${e2eBkId}/inspections/initial/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${e2eFarmerToken}` }
+    });
+    const [chkE2eInProgressBk] = await pool.query("SELECT status FROM bookings WHERE id = ?", [e2eBkId]);
+    const [chkE2eInUseEq] = await pool.query("SELECT status FROM equipment WHERE id = ?", [e2eEquipmentId]);
+    assert(
+        resE2eOwnerInitConf.status === 200 &&
+        resE2eFarmerInitConf.status === 200 &&
+        chkE2eInProgressBk[0]?.status === "IN_PROGRESS" &&
+        chkE2eInUseEq[0]?.status === "IN_USE",
+        "E2E Step 14: Stage 1 Initial Inspection (Both parties confirm, booking -> IN_PROGRESS, equipment -> IN_USE)",
+        `bkStatus=${chkE2eInProgressBk[0]?.status}, eqStatus=${chkE2eInUseEq[0]?.status}`
+    );
+
+    // STEP 15 & 16: Stage 2 Final Return Inspection with Damage & Dispute Auto-Creation
+    await pool.query(
+        `INSERT INTO equipment_inspections (
+            booking_id, equipment_id, inspection_stage, inspector_role, inspector_user_id,
+            engine_condition, tyres_condition, body_condition, fuel_level, is_damage_reported, damage_description, is_confirmed
+         ) VALUES
+         (?, ?, 'FINAL', 'OWNER', ?, 'EXCELLENT', 'FAIR', 'DAMAGED', 'HALF', TRUE, 'Cracked threshing cylinder cover', FALSE),
+         (?, ?, 'FINAL', 'FARMER', ?, 'EXCELLENT', 'GOOD', 'GOOD', 'HALF', FALSE, null, FALSE)`,
+        [e2eBkId, e2eEquipmentId, e2eOwnerUserId, e2eBkId, e2eEquipmentId, e2eFarmerUserId]
+    );
+
+    const resE2eOwnerFinalConf = await apiRequest(`/bookings/${e2eBkId}/inspections/final/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${e2eOwnerToken}` }
+    });
+    const resE2eFarmerFinalConf = await apiRequest(`/bookings/${e2eBkId}/inspections/final/confirm`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${e2eFarmerToken}` }
+    });
+    const [chkE2eDispBk] = await pool.query("SELECT status FROM bookings WHERE id = ?", [e2eBkId]);
+    const [chkE2eDamEq] = await pool.query("SELECT status FROM equipment WHERE id = ?", [e2eEquipmentId]);
+    const [chkE2eDisp] = await pool.query("SELECT id, status FROM refund_disputes WHERE booking_id = ?", [e2eBkId]);
+    const e2eDisputeId = chkE2eDisp[0]?.id;
+
+    assert(
+        resE2eOwnerFinalConf.status === 200 &&
+        resE2eFarmerFinalConf.status === 200 &&
+        chkE2eDispBk[0]?.status === "DISPUTED" &&
+        chkE2eDamEq[0]?.status === "DAMAGED" &&
+        chkE2eDisp.length > 0 &&
+        chkE2eDisp[0]?.status === "UNDER_ADMIN_REVIEW",
+        "E2E Step 15 & 16: Stage 2 Return & Damage Reporting (Booking -> DISPUTED, equipment -> DAMAGED, dispute opened)",
+        `bkStatus=${chkE2eDispBk[0]?.status}, eqStatus=${chkE2eDamEq[0]?.status}, dispId=${e2eDisputeId}`
+    );
+
+    // STEP 17: Platform Dispute Resolution & Settlement
+    const resE2eResolveDispute = await apiRequest(`/admin/super/disputes/${e2eDisputeId}/decide`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${superAdminToken}` },
+        body: {
+            decision: "REFUND_REQUIRED",
+            reason: "Damage resolved amicably via platform coverage guarantee",
+            remarks: "Owner must submit refund transaction within 24 hours."
+        }
+    });
+    const [chkFinalDispute] = await pool.query("SELECT status FROM refund_disputes WHERE id = ?", [e2eDisputeId]);
+    assert(
+        resE2eResolveDispute.status === 200 &&
+        chkFinalDispute[0]?.status === "RESOLVED",
+        "E2E Step 17: Platform Dispute Resolution (Super Admin resolves dispute -> RESOLVED with audit log)",
+        `status=${resE2eResolveDispute.status}, dispStatus=${chkFinalDispute[0]?.status}`
+    );
+
+    // Clean up E2E records
+    await pool.query("DELETE FROM dispute_evidence WHERE dispute_id = ?", [e2eDisputeId]);
+    await pool.query("DELETE FROM refund_disputes WHERE id = ?", [e2eDisputeId]);
+    await pool.query("DELETE FROM equipment_inspections WHERE booking_id = ?", [e2eBkId]);
+    await pool.query("DELETE FROM booking_payments WHERE booking_id = ?", [e2eBkId]);
+    await pool.query("DELETE FROM bookings WHERE id = ?", [e2eBkId]);
+    await pool.query("DELETE FROM equipment_media WHERE equipment_id = ?", [e2eEquipmentId]);
+    await pool.query("DELETE FROM equipment WHERE id = ?", [e2eEquipmentId]);
+    await pool.query("DELETE FROM owners WHERE id = ?", [e2eOwnerId]);
+    await pool.query("DELETE FROM farmers WHERE user_id = ?", [e2eFarmerUserId]);
+    await pool.query("DELETE FROM users WHERE id IN (?, ?)", [e2eFarmerUserId, e2eOwnerUserId]);
+    await pool.query("DELETE FROM user_otps WHERE email IN (?, ?)", [e2eFarmerEmail, e2eOwnerEmail]);
 
     // Clean up test server
     server.close();

@@ -7,10 +7,43 @@ import {
     rejectPayment,
     submitRefund,
     confirmRefund,
-    disputeRefund
+    disputeRefund,
+    getPaymentById,
+    getBookingPayments,
+    getFarmerPayments,
+    getOwnerPayments,
+    getRefunds
 } from "../controllers/paymentController.js";
 
 const router = express.Router();
+
+// Specific read routes (mounted before :paymentId)
+router.get(
+    "/payments/farmer",
+    authenticateUser,
+    authorizeRoles("FARMER"),
+    getFarmerPayments
+);
+
+router.get(
+    "/payments/owner",
+    authenticateUser,
+    authorizeRoles("OWNER"),
+    getOwnerPayments
+);
+
+router.get(
+    "/payments/refunds",
+    authenticateUser,
+    authorizeRoles("OWNER", "FARMER", "AREA_ADMIN", "SUPER_ADMIN"),
+    getRefunds
+);
+
+router.get(
+    "/payments/booking/:bookingId",
+    authenticateUser,
+    getBookingPayments
+);
 
 // 1. Farmer submits advance payment
 router.post(
@@ -20,7 +53,14 @@ router.post(
     submitPayment
 );
 
-// 2. Owner verifies advance payment
+// 2. Read single payment by ID
+router.get(
+    "/payments/:paymentId",
+    authenticateUser,
+    getPaymentById
+);
+
+// 3. Owner verifies advance payment
 router.patch(
     "/payments/:paymentId/verify",
     authenticateUser,
@@ -28,7 +68,7 @@ router.patch(
     verifyPayment
 );
 
-// 3. Owner rejects advance payment
+// 4. Owner rejects advance payment
 router.patch(
     "/payments/:paymentId/reject",
     authenticateUser,
@@ -36,7 +76,7 @@ router.patch(
     rejectPayment
 );
 
-// 4. Authorized owner (or Area/Super Admin) submits refund details
+// 5. Authorized owner (or Area/Super Admin) submits refund details
 router.patch(
     "/payments/:paymentId/refund",
     authenticateUser,
@@ -44,7 +84,7 @@ router.patch(
     submitRefund
 );
 
-// 5. Farmer confirms receipt of refund
+// 6. Farmer confirms receipt of refund
 router.patch(
     "/payments/:paymentId/refund/confirm",
     authenticateUser,
@@ -52,7 +92,7 @@ router.patch(
     confirmRefund
 );
 
-// 6. Farmer raises refund dispute
+// 7. Farmer raises refund dispute
 router.patch(
     "/payments/:paymentId/refund/dispute",
     authenticateUser,

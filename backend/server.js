@@ -19,7 +19,9 @@ import {
 } from "./middleware/securityMiddleware.js";
 import {
     checkPaymentVerificationTimeouts,
-    checkBookingAcceptanceTimeouts
+    checkBookingAcceptanceTimeouts,
+    cleanExpiredOTPs,
+    runWithLock
 } from "./services/paymentTimeoutService.js";
 import {
     checkInspectionMediaCleanupTimeouts
@@ -164,9 +166,12 @@ const runTimeoutChecks = async () => {
     }
     isRunningTimeoutChecks = true;
     try {
-        await checkPaymentVerificationTimeouts();
-        await checkBookingAcceptanceTimeouts();
-        await checkInspectionMediaCleanupTimeouts();
+        await runWithLock("agrirent_cron_lock", 0, async () => {
+            await checkPaymentVerificationTimeouts();
+            await checkBookingAcceptanceTimeouts();
+            await checkInspectionMediaCleanupTimeouts();
+            await cleanExpiredOTPs();
+        });
     } catch (error) {
         console.error("Timeout scheduler error:", error.message || error);
     } finally {

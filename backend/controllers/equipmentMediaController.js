@@ -79,38 +79,57 @@ export const uploadEquipmentMedia = async (req, res) => {
         // 4. Resolve uploaded_by strictly from authenticated user
         const uploadedBy = req.user.id;
 
-        // 5. Detect media type from MIME type
+        // 5. Detect and validate media type strictly for IMAGE and VIDEO
         const isVideo = req.file.mimetype.startsWith("video/");
+        const isImage = req.file.mimetype.startsWith("image/");
+
+        if (!isVideo && !isImage) {
+            return res.status(400).json({
+                success: false,
+                message: "Only image (JPG, PNG, WEBP) or video (MP4, WEBM) files are permitted for equipment media"
+            });
+        }
+
         const mediaType = isVideo ? "VIDEO" : "IMAGE";
         const resourceType = isVideo ? "video" : "image";
 
         // 6. Upload file buffer to Cloudinary
         const result = await uploadToCloudinary(req.file.buffer, resourceType);
 
-        // 7. Store Cloudinary secure_url in MySQL equipment_media table
-        const [insertResult] = await pool.query(
-            `INSERT INTO equipment_media
-            (equipment_id, media_type, file_url, public_id, uploaded_by)
-            VALUES (?, ?, ?, ?, ?)`,
-            [
-                equipmentIdNumber,
-                mediaType,
-                result.secure_url,
-                result.public_id,
-                uploadedBy
-            ]
-        );
+        try {
+            // 7. Store Cloudinary secure_url in MySQL equipment_media table
+            const [insertResult] = await pool.query(
+                `INSERT INTO equipment_media
+                (equipment_id, media_type, file_url, public_id, uploaded_by)
+                VALUES (?, ?, ?, ?, ?)`,
+                [
+                    equipmentIdNumber,
+                    mediaType,
+                    result.secure_url,
+                    result.public_id,
+                    uploadedBy
+                ]
+            );
 
-        return res.status(201).json({
-            success: true,
-            message: "Media uploaded successfully",
-            data: {
-                id: insertResult.insertId,
-                equipmentId: Number(equipmentId),
-                mediaType,
-                fileUrl: result.secure_url
+            return res.status(201).json({
+                success: true,
+                message: "Media uploaded successfully",
+                data: {
+                    id: insertResult.insertId,
+                    equipmentId: Number(equipmentId),
+                    mediaType,
+                    fileUrl: result.secure_url
+                }
+            });
+        } catch (dbError) {
+            // Roll back Cloudinary asset on database failure
+            if (result && result.public_id) {
+                await cloudinary.uploader.destroy(result.public_id, {
+                    resource_type: resourceType
+                }).catch(cleanErr => console.warn("Cloudinary upload rollback warning:", cleanErr.message));
             }
-        });
+            throw dbError;
+        }
 
     } catch (error) {
         console.error("Upload equipment media error:", error.message || error);
